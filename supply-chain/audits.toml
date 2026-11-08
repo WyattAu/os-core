@@ -1,4 +1,8 @@
 
 # cargo-vet audits file
 
-[audits]
+[[audits.tokio]]
+who = "WyattAu <wyatt_au@protonmail.com>"
+criteria = "safe-to-deploy"
+delta = "1.53.2 -> 1.53.3"
+notes = "RUSTSEC-2026-0386 patch release (AsyncFd I/O-safety fix, tokio-rs/tokio#8587); reviewed diff tokio 1.53.2 -> 1.53.3, 36 files patch-level churn."
