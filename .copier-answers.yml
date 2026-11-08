@@ -1,0 +1,5 @@
+_commit: 4edaddc75e1e2aeb457fba8e23076f60e1302eee
+_src_path: https://github.com/WyattAu/OmniRust-template
+exclude:
+- copier.yml
+project_name: os-core
