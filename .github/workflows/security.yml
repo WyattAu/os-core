@@ -1,0 +1,68 @@
+# Workflow security lint (zizmor) + dependency vulnerability scan (osv).
+# Both are ADVISORY (continue-on-error) until the estate tunes thresholds
+# (LOOP.md graduation policy).
+name: security
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # merge_group: GitHub merge queues validate a grouped future state of main;
+  # without this trigger the queue would wait forever for checks that never
+  # report (research note 39). No-op until the owner enables the queue.
+  merge_group:
+  schedule:
+    - cron: "0 8 * * 5" # Fridays 08:00 UTC
+
+permissions: read-all
+
+jobs:
+  zizmor:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: zizmor (GitHub Actions security lint)
+        uses: zizmorcore/zizmor-action@cc914d7f3750a2d13d75c7f184a1060aa0e9d482 # v0.6.4
+        with:
+          advanced-security: false
+          # The action does not discover .zizmor.yml on its own; without this the
+          # documented impostor-commit suppression is silently ignored (loop 30).
+          config: .zizmor.yml
+          # Blocking since loop 30: High-severity findings (template-injection,
+          # cache-poisoning) fail the run. Medium/Low are still printed -- an
+          # error-class finding sat unreported for weeks on an advisory job
+          # (loop 28), so visibility is retained, severity is enforced.
+          min-severity: high
+
+  # Licensing compliance: REUSE spec 3.3 (machine-readable REUSE.toml +
+  # LICENSES/). Advisory for one loop, then graduates (LOOP.md policy).
+  reuse:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: "3.12"
+      - run: pip install reuse
+      - run: reuse lint
+  # PR-time supply-chain gate (research note 40): fail on newly introduced
+  # dependencies with known HIGH-severity vulnerabilities, and on licenses
+  # incompatible with the estate's Apache-2.0 position. Runs on PRs only.
+  dependency-review:
+    name: dependency review
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294  # v5.0.0
+        with:
+          fail-on-severity: high
+          deny-licenses: "GPL-2.0, GPL-3.0, AGPL-3.0, LGPL-3.0"
