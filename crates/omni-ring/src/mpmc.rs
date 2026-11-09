@@ -86,4 +86,15 @@ mod tests {
         assert_eq!(ring.pop(), Some(7));
         assert!(ring.is_empty());
     }
+
+    #[test]
+    fn capacity_len_and_debug_delegate() {
+        let ring: MpmcRing<u64> = MpmcRing::new(9);
+        assert_eq!(ring.capacity(), 9);
+        assert!(ring.is_empty());
+        assert!(ring.push(1).is_ok());
+        assert!(!ring.is_empty());
+        assert_eq!(ring.len(), 1);
+        assert!(format!("{ring:?}").contains("MpmcRing"));
+    }
 }

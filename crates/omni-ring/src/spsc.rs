@@ -174,4 +174,18 @@ mod tests {
         assert_eq!(ring.try_pop(), None);
         assert_eq!(ring.capacity(), 4);
     }
+
+    #[test]
+    fn debug_default_and_fullness_are_usable() {
+        let ring: SpscRing<4> = SpscRing::default();
+        assert!(ring.is_empty());
+        assert!(format!("{ring:?}").contains("capacity: 4"));
+        for v in 0..4_u64 {
+            assert_eq!(ring.try_push(v), None);
+        }
+        assert!(ring.is_full());
+        assert!(!ring.is_empty());
+        assert_eq!(ring.len(), 4);
+        assert!(format!("{ring:?}").contains("len: 4"));
+    }
 }

@@ -128,11 +128,10 @@ jobs:
           diff -r --exclude=.copier-answers.yml --exclude=.copier-answers.yml.jinja --exclude=.git --exclude=copier.yml \
             "$RUNNER_TEMP/sc" "$RUNNER_TEMP/tracked"
 
-  # REQ-OS-003: Lean proof gate (OMNI-CORE 11f). Advisory now; flips to
-  # blocking after one clean loop (LOOP.md graduation policy, same as
-  # perf/repro above). Runs the same scripts/ command a developer runs.
+  # REQ-OS-003: Lean proof gate (OMNI-CORE 11f). Green in its first full CI
+  # run (run 42568793915), so it graduates to blocking per the LOOP.md
+  # one-clean-loop policy — the same path perf/repro took.
   lean:
-    continue-on-error: true
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1

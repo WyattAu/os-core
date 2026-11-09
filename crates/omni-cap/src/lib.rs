@@ -169,4 +169,16 @@ mod tests {
         let moved = cap;
         assert_eq!(moved.pasid, 1);
     }
+
+    #[test]
+    fn debug_renders_fields_but_seals_authenticator() {
+        let mut cap = HardwareCapability::new(0x2000, 0x10, perms::READ, 3);
+        cap.auth_mac[0] = 0xAB;
+        let rendered = format!("{cap:?}");
+        assert!(rendered.contains("base_phys_addr: 8192"));
+        assert!(rendered.contains("epoch: 0"));
+        assert!(rendered.contains("<sealed>"));
+        // 0xAB = 171 decimal must not leak through the debug render.
+        assert!(!rendered.contains("171"));
+    }
 }
