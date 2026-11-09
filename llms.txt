@@ -12,4 +12,6 @@ scaffolds sharing one gate matrix (engineering-standards).
 - [OMNI-CORE](https://github.com/WyattAu/engineering-standards/blob/main/OMNI-CORE.md): the family-wide contract
 - [CONTRIBUTING](https://github.com/WyattAu/OmniRust-template/blob/main/CONTRIBUTING.md): workflow rules
 - [AGENTS.md](https://github.com/WyattAu/OmniRust-template/blob/main/AGENTS.md): instructions for AI agents
+- [Goals index](https://github.com/WyattAu/OmniRust-template/blob/main/docs/goals/index.md): vision corpus (1,250 breakthroughs / 126 pillars), keystones, ten-year phases
+- [ADR-0009](https://github.com/WyattAu/OmniRust-template/blob/main/docs/adr/0009-ten-year-goals-phasing.md): ten-year phasing decision
 - [engineering-standards](https://github.com/WyattAu/engineering-standards): the estate gate matrix
