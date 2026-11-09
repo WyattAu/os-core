@@ -1,0 +1,12 @@
+[package]
+name = "io-spike"
+description = "REQ-OS-004 spike: doorbell-driven submission economics on Linux (not published, not gated)."
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = "0.7"
+
+[profile.release]
+lto = "thin"
