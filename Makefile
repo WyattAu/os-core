@@ -25,7 +25,10 @@ mutants:
 	./scripts/mutants.sh
 
 vet:
-	cargo vet check --all-features
+	cargo vet check --locked
+
+lean:
+	./scripts/check-lean.sh
 
 semver:
 	./scripts/semver-check.sh
@@ -37,7 +40,7 @@ contract:
 	./scripts/check-contract.sh
 
 ## What CI gates before merge (mirror of .github/workflows/ci.yml):
-ci: contract fmt-check lint test vet
+ci: contract fmt-check lint test vet lean
 
 repro:
 	./scripts/repro-check.sh

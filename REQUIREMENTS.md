@@ -28,9 +28,9 @@ first shippable artifacts only.
 
 | ID | Requirement | Priority |
 |----|-------------|----------|
-| REQ-OS-001 | `omni-ring`: wait-free bounded SPSC and MPMC rings; loom- and miri-clean; p99 enqueue/dequeue latency benched against `bench/baseline.tsv` | MUST |
-| REQ-OS-002 | `omni-cap`: 64-byte capability token type; ring-index and token-algebra theorems machine-checked in Lean 4 (`lake build`, zero `sorry`) | MUST |
-| REQ-OS-003 | Lean 4 proof leg in CI: `lake build` (zero `sorry`) over proof crates; advisory first, blocking after one clean loop | MUST |
+| REQ-OS-001 | `omni-ring`: wait-free bounded SPSC ring (`u64` descriptors, generic payload tracked as follow-up) and lock-free bounded MPMC ring (`crossbeam-queue`, estate precedent); loom- and miri-clean; throughput benched against `bench/baseline.tsv` | MUST |
+| REQ-OS-002 | `omni-cap`: 64-byte cache-line-aligned capability token (bounds, permissions, epoch; `auth_mac` field reserved, sealing via reviewed crate tracked as follow-up); ring-index and token-algebra theorems machine-checked in Lean 4 (`lake build`, zero `sorry`) | MUST |
+| REQ-OS-003 | Lean 4 proof leg in CI: `lake build` (zero `sorry`) over `proofs/`; advisory first, blocking after one clean loop | MUST |
 | REQ-OS-004 | io_uring/DPDK spike validating doorbell-driven submission idioms on Linux; results recorded as a bench note plus a follow-up ADR | SHOULD |
 
 ## Traceability Matrix

@@ -1,0 +1,29 @@
+[package]
+name = "omni-ring"
+description = "Wait-free bounded SPSC descriptor ring and lock-free bounded MPMC ring (REQ-OS-001)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+crossbeam-queue = { workspace = true }
+loom = { version = "0.7", optional = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+proptest = { workspace = true }
+
+[features]
+default = []
+# Model-checking double for CI's loom leg (estate rust-kit `loom: true`).
+loom = ["dep:loom"]
+
+[[bench]]
+name = "ring"
+harness = false

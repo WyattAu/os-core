@@ -14,9 +14,19 @@ libfuzzer-sys = "0.4"
 [dependencies.omni-core]
 path = "../crates/omni-core"
 
+[dependencies.omni-ring]
+path = "../crates/omni-ring"
+
 [[bin]]
 name = "parse_pub_id"
 path = "fuzz_targets/parse_pub_id.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "spsc_model"
+path = "fuzz_targets/spsc_model.rs"
 test = false
 doc = false
 bench = false

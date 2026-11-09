@@ -26,6 +26,7 @@
             cargo-semver-checks
             cargo-audit
             cargo-fuzz
+            elan # Lean toolchain manager; proofs/ pins the version via lean-toolchain
 
             pkg-config
             openssl

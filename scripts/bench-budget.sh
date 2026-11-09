@@ -40,8 +40,13 @@ done
 python3 - <<'PYEMIT' >"$CURRENT"
 import json
 import pathlib
+import subprocess
 
-root = pathlib.Path("target/criterion")
+# Resolve the real target dir (CARGO_TARGET_DIR may redirect it globally);
+# a hardcoded "target/criterion" breaks shared-target machines.
+target_dir = pathlib.Path(json.loads(subprocess.check_output(
+    ["cargo", "metadata", "--format-version", "1", "--no-deps"]))["target_directory"])
+root = target_dir / "criterion"
 rows = []
 for estimates in sorted(root.glob("*/current/estimates.json")):
     meta = json.loads((estimates.parent / "benchmark.json").read_text())

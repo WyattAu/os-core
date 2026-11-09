@@ -127,3 +127,26 @@ jobs:
           copier copy --defaults "$RUNNER_TEMP/tracked" "$RUNNER_TEMP/sc"
           diff -r --exclude=.copier-answers.yml --exclude=.copier-answers.yml.jinja --exclude=.git --exclude=copier.yml \
             "$RUNNER_TEMP/sc" "$RUNNER_TEMP/tracked"
+
+  # REQ-OS-003: Lean proof gate (OMNI-CORE 11f). Advisory now; flips to
+  # blocking after one clean loop (LOOP.md graduation policy, same as
+  # perf/repro above). Runs the same scripts/ command a developer runs.
+  lean:
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      # NOTE: curl-pipe-sh is a supply-chain risk. Pinning elan to a specific
+      # release mitigates this; promote to a shared lean-kit workflow when
+      # one exists estate-wide (survey: no lean-kit.yml in engineering-standards).
+      - name: Install Lean4 (elan, pinned)
+        run: |
+          ELAN_VERSION="4.0.0"
+          curl --fail -L "https://github.com/leanprover/elan/releases/download/v${ELAN_VERSION}/elan-x86_64-unknown-linux-gnu.tar.gz" -o elan.tar.gz
+          tar -xzf elan.tar.gz
+          ./elan-init -y --default-toolchain none
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+      - run: ./scripts/check-lean.sh

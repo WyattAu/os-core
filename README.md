@@ -40,14 +40,18 @@ VS Code) — part of the [WyattAu Omni template family](https://github.com/Wyatt
 
 ```
 crates/omni-core      L0 leaf: no_std-capable, REQ-tagged, proptest, bench, fuzz target
+crates/omni-ring      L0 leaf: wait-free SPSC + lock-free MPMC rings (REQ-OS-001)
+crates/omni-cap       L0 leaf: 64-byte capability token (REQ-OS-002)
 crates/omni-service   L3 example: axum, health/ready, graceful shutdown
 crates/omni-cli       example clap binary composing on omni-core
+proofs/               Lean 4 theorems backing ring/cap properties (REQ-OS-002/003)
 xtask/                workspace task runner (coverage/mutants/vet/semver/contract)
 fuzz/                 cargo-fuzz harnesses
 supply-chain/         cargo-vet (config + audits; imports.lock via cargo vet)
 deny.toml             dependency governance (licenses/advisories/bans)
 docs/adr/             decision log (start at 0000)
-.github/workflows/    ci (tier a + msrv + contract), release, docs, mutation, vet-refresh, devcontainers
+docs/goals/           vision corpus: 1,250 breakthroughs, keystones, phases (ADR-0009)
+.github/workflows/    ci (tier a + msrv + contract + lean), release, docs, mutation, vet-refresh, devcontainers
 .forgejo/             thin self-hosted mirror (scripts are canonical)
 ```
 
@@ -67,6 +71,7 @@ docs/adr/             decision log (start at 0000)
 | semver-checks | on version diff |
 | mutation testing | weekly, promotes to gate per policy |
 | devcontainers | both flavors built in CI |
+| lean (`proofs/`) | advisory: `lake build`, zero `sorry`, `#print axioms` per theorem (REQ-OS-003) |
 
 ## Optional toggles (documented patterns, add the crate when needed)
 

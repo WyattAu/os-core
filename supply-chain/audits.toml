@@ -1,6 +1,12 @@
 
 # cargo-vet audits file
 
+[[audits.crossbeam-queue]]
+who = "WyattAu <wyatt_au@protonmail.com>"
+criteria = "safe-to-deploy"
+version = "0.3.14"
+notes = "Deliberate direct dependency of omni-ring (REQ-OS-001 MPMC leg; estate precedent: actor-kit mailboxes, ferro event-bus). Reviewed crate source (ArrayQueue: lock-free bounded MPMC ring, ~2.5k lines incl. tests); same maintainer (taiki-e) and audit posture as the already-exempted crossbeam-utils/epoch/deque."
+
 [[audits.tokio]]
 who = "WyattAu <wyatt_au@protonmail.com>"
 criteria = "safe-to-deploy"
