@@ -34,6 +34,7 @@ multiple_crate_versions = "allow"
 omni-core = { path = "crates/omni-core", version = "0.1.0" }
 omni-ring = { path = "crates/omni-ring", version = "0.1.0" }
 omni-cap = { path = "crates/omni-cap", version = "0.1.0" }
+siphasher = "1"
 crossbeam-queue = "0.3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
 axum = "0.8"

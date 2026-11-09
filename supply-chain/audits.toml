@@ -7,6 +7,12 @@ criteria = "safe-to-deploy"
 version = "0.3.14"
 notes = "Deliberate direct dependency of omni-ring (REQ-OS-001 MPMC leg; estate precedent: actor-kit mailboxes, ferro event-bus). Reviewed crate source (ArrayQueue: lock-free bounded MPMC ring, ~2.5k lines incl. tests); same maintainer (taiki-e) and audit posture as the already-exempted crossbeam-utils/epoch/deque."
 
+[[audits.siphasher]]
+who = "WyattAu <wyatt_au@protonmail.com>"
+criteria = "safe-to-deploy"
+version = "1.0.4"
+notes = "Deliberate direct dependency of omni-cap (REQ-OS-002 auth_mac sealing, ADR-0012). Reviewed crate source: SipHash-2-4/1-3 implementations (jedisct1), ~600 lines incl. tests, zero runtime dependencies; used only as the PRF under omni-cap's four-lane MAC composition, never over hostile channels."
+
 [[audits.tokio]]
 who = "WyattAu <wyatt_au@protonmail.com>"
 criteria = "safe-to-deploy"

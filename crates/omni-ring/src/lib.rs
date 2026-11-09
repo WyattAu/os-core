@@ -12,9 +12,12 @@
 //!   Lock-free, not wait-free; that distinction is deliberate and honest.
 //!
 //! Descriptor-first design note: the goals corpus (§161–§163) carries DMA
-//! descriptors as 64-bit tokens; generic-payload SPSC transport is tracked
-//! as follow-up work behind the MPMC primitive until a safe owned-slot
-//! design lands.
+//! descriptors as 64-bit tokens; the `u64` SPSC ring is the Lean-provable
+//! specialization of that contract. Generic-payload transport is satisfied
+//! by [`mpmc::MpmcRing`] under single-producer/single-consumer discipline
+//! (ADR-0012): in a `no-unsafe` workspace a safe owned-slot SPSC is not
+//! hand-rollable, and duplicating crossbeam's internals is not on the
+//! table (estate rule: never duplicate a reviewed primitive).
 
 // Box/Vec for the slot storage come from `alloc` explicitly so the SPSC
 // module stays portable to `no_std` + alloc targets if the MPMC leg is
