@@ -128,25 +128,13 @@ jobs:
           diff -r --exclude=.copier-answers.yml --exclude=.copier-answers.yml.jinja --exclude=.git --exclude=copier.yml \
             "$RUNNER_TEMP/sc" "$RUNNER_TEMP/tracked"
 
-  # REQ-OS-003: Lean proof gate (OMNI-CORE 11f). Green in its first full CI
-  # run (run 42568793915), so it graduates to blocking per the LOOP.md
-  # one-clean-loop policy — the same path perf/repro took.
+  # REQ-OS-003: Lean proof gate (OMNI-CORE 11f), via the estate's shared
+  # lean-kit workflow (survey found no estate-wide leg; this repo's leg was
+  # the reference implementation and is now promoted). Blocking: green in
+  # its first full CI run (run 42568793915) per the LOOP.md one-clean-loop
+  # policy — the same path perf/repro took.
   lean:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-        with:
-          persist-credentials: false
-
-      # NOTE: curl-pipe-sh is a supply-chain risk. Pinning elan to a specific
-      # release mitigates this; promote to a shared lean-kit workflow when
-      # one exists estate-wide (survey: no lean-kit.yml in engineering-standards).
-      - name: Install Lean4 (elan, pinned)
-        run: |
-          ELAN_VERSION="4.0.0"
-          curl --fail --retry 5 --retry-delay 3 --retry-all-errors \
-            -L "https://github.com/leanprover/elan/releases/download/v${ELAN_VERSION}/elan-x86_64-unknown-linux-gnu.tar.gz" -o elan.tar.gz
-          tar -xzf elan.tar.gz
-          ./elan-init -y --default-toolchain none
-          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
-      - run: ./scripts/check-lean.sh
+    uses: WyattAu/engineering-standards/.github/workflows/lean-kit.yml@50296752b3a661a29020fd854fbe71efd7c381ac
+    with:
+      elan-version: "4.0.0"
+      script: ./scripts/check-lean.sh
