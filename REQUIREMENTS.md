@@ -32,6 +32,7 @@ first shippable artifacts only.
 | REQ-OS-002 | `omni-cap`: 64-byte cache-line-aligned capability token (bounds, permissions, epoch; `auth_mac` sealed via domain-separated SipHash-2-4 lanes, ADR-0012); ring-index and token-algebra theorems machine-checked in Lean 4 (`lake build`, zero `sorry`) | MUST |
 | REQ-OS-003 | Lean 4 proof leg in CI: `lake build` (zero `sorry`) over `proofs/`; advisory first, blocking after one clean loop | MUST |
 | REQ-OS-004 | io_uring/DPDK spike validating doorbell-driven submission idioms on Linux; results recorded as a bench note plus a follow-up ADR | SHOULD |
+| REQ-OS-005 | `omniosk` seed (K4): boot-capable `no_std` library modules (serial `PortIo` seam, qemu-exit, bare-metal ring integration) host-tested under tier-a gates; kernel bin + QEMU harness per ADR-0013 | SHOULD |
 
 ## Traceability Matrix
 
@@ -43,3 +44,4 @@ first shippable artifacts only.
 | REQ-OS-002 | `lake build` gate over `proofs/` theorem files | machine-checked |
 | REQ-OS-003 | CI lean leg (advisory → gate per loop policy) | structural |
 | REQ-OS-004 | spike bench note + follow-up ADR | empirical |
+| REQ-OS-005 | omniosk unit tests over mock port sink; boot path per ADR-0013 | unit + design |
