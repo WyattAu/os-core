@@ -45,6 +45,7 @@ crates/omni-cap       L0 leaf: 64-byte capability token (REQ-OS-002)
 crates/omni-service   L3 example: axum, health/ready, graceful shutdown
 crates/omni-cli       example clap binary composing on omni-core
 crates/omniosk        K4 seed: no_std kernel-adjacent modules (REQ-OS-005, ADR-0013)
+kernels/omniosk-kernel QEMU-bootable PVH kernel: verified ring on bare metal (excluded from workspace gates; `scripts/qemu-omniosk.sh`)
 proofs/               Lean 4 theorems backing ring/cap properties (REQ-OS-002/003)
 xtask/                workspace task runner (coverage/mutants/vet/semver/contract)
 fuzz/                 cargo-fuzz harnesses

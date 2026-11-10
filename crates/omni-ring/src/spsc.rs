@@ -16,8 +16,6 @@
 //! `Acquire` before reusing a slot. That pair closes both edges of the
 //! wraparound reuse race. Zero `SeqCst`; zero `unsafe`.
 
-use alloc::boxed::Box;
-use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 /// Pads a cursor to its own cache line so producer and consumer never
@@ -31,7 +29,7 @@ struct Padded(AtomicUsize);
 pub struct SpscRing<const CAP: usize> {
     head: Padded,
     tail: Padded,
-    slots: Box<[AtomicU64]>,
+    slots: [AtomicU64; CAP],
 }
 
 impl<const CAP: usize> SpscRing<CAP> {
@@ -44,11 +42,10 @@ impl<const CAP: usize> SpscRing<CAP> {
                 "CAP must be a positive power of two"
             );
         }
-        let slots: Vec<_> = (0..CAP).map(|_| AtomicU64::new(0)).collect();
         Self {
             head: Padded(AtomicUsize::new(0)),
             tail: Padded(AtomicUsize::new(0)),
-            slots: slots.into_boxed_slice(),
+            slots: core::array::from_fn(|_| AtomicU64::new(0)),
         }
     }
 

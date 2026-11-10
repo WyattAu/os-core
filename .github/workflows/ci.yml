@@ -32,6 +32,23 @@ jobs:
       # from the line gate; the lib surface stays at >=90%.
       coverage-ignore-regex: xtask/src|omni-service/src/main.rs
 
+  # REQ-OS-005 / ADR-0013: boots omniosk-kernel (PVH -> long mode) in QEMU
+  # and asserts the verified-ring smoke over serial. Advisory first;
+  # graduates to blocking after one clean loop (LOOP.md policy).
+  qemu-smoke:
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          targets: x86_64-unknown-none
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends qemu-system-x86
+      - run: ./scripts/qemu-omniosk.sh
+
   msrv:
     runs-on: ubuntu-latest
     steps:

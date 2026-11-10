@@ -13,16 +13,20 @@
 //!
 //! Descriptor-first design note: the goals corpus (§161–§163) carries DMA
 //! descriptors as 64-bit tokens; the `u64` SPSC ring is the Lean-provable
-//! specialization of that contract. Generic-payload transport is satisfied
-//! by [`mpmc::MpmcRing`] under single-producer/single-consumer discipline
-//! (ADR-0012): in a `no-unsafe` workspace a safe owned-slot SPSC is not
-//! hand-rollable, and duplicating crossbeam's internals is not on the
-//! table (estate rule: never duplicate a reviewed primitive).
+//! specialization of that contract — and it is allocation-free (inline
+//! slot array), so it runs in `no_std`-no-alloc kernels (omniosk, ADR-0013).
+//! Generic-payload transport is satisfied by [`mpmc::MpmcRing`] under
+//! single-producer/single-consumer discipline (ADR-0012): in a `no-unsafe`
+//! workspace a safe owned-slot SPSC is not hand-rollable, and duplicating
+//! crossbeam's internals is not on the table (estate rule: never duplicate
+//! a reviewed primitive).
+//!
+//! `no_std` note: the crate links `std` only through the `mpmc` feature
+//! (crossbeam). With `default-features = false` it is a pure-`core` crate
+//! suitable for `x86_64-unknown-none` kernels (ADR-0013).
 
-// Box/Vec for the slot storage come from `alloc` explicitly so the SPSC
-// module stays portable to `no_std` + alloc targets if the MPMC leg is
-// feature-gated out later.
-extern crate alloc;
+#![cfg_attr(not(feature = "mpmc"), no_std)]
 
+#[cfg(feature = "mpmc")]
 pub mod mpmc;
 pub mod spsc;

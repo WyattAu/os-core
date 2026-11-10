@@ -1,0 +1,20 @@
+[package]
+name = "omniosk-kernel"
+description = "omniosk kernel binary: multiboot -> long mode -> verified ring smoke (ADR-0013). Not published, outside the workspace gates; correctness argument is the QEMU smoke."
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# THE unsafe boundary of the os-core program (ADR-0013): raw port I/O and
+# the boot trampoline. Scoped to this package; estate crates stay deny.
+[lints.rust]
+unsafe_code = "allow"
+
+[dependencies]
+omniosk = { path = "../../crates/omniosk" }
+omni-ring = { path = "../../crates/omni-ring", default-features = false }
+
+[profile.release]
+panic = "abort"
+lto = "thin"
+codegen-units = 1

@@ -1,0 +1,15 @@
+# omniosk-kernel build: freestanding x86_64 with the repo's linker script.
+# Paths are relative to this directory (scripts/qemu-omniosk.sh cds here).
+[build]
+target = "x86_64-unknown-none"
+
+[target.x86_64-unknown-none]
+linker = "rust-lld"
+rustflags = [
+    "-C", "link-arg=-T",
+    "-C", "link-arg=kern.ld",
+    "-C", "link-arg=--nmagic",
+    "-C", "link-arg=--no-relax",
+    "-C", "link-arg=--no-pie",
+    "-C", "link-arg=-static",
+]

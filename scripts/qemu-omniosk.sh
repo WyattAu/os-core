@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# REQ-OS-005 / ADR-0013: boot omniosk-kernel in QEMU and assert the
+# verified-ring smoke over serial, with a clean isa-debug-exit status.
+set -euo pipefail
+cd "$(dirname "$0")/../kernels/omniosk-kernel"
+
+command -v qemu-system-x86_64 >/dev/null || {
+    echo "qemu-system-x86_64 missing (host: pacman -S qemu; CI: apt qemu-system-x86)" >&2
+    exit 2
+}
+rustup target list --installed | grep -q x86_64-unknown-none || {
+    echo "x86_64-unknown-none target missing (rustup target add x86_64-unknown-none)" >&2
+    exit 2
+}
+
+cargo build --release
+
+# The fleet may redirect the target dir globally; resolve the real path.
+BIN="$(cargo metadata --format-version 1 --no-deps \
+    | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')/x86_64-unknown-none/release/omniosk-kernel"
+
+log="$(mktemp)"
+trap 'rm -f "$log"' EXIT
+
+set +e
+timeout 60 qemu-system-x86_64 \
+    -kernel "$BIN" \
+    -serial "file:$log" \
+    -display none \
+    -no-reboot \
+    -m 128M \
+    -device isa-debug-exit,iobase=0xf4,iosize=0x04
+status=$?
+set -e
+
+if [ "$status" -ne 127 ]; then
+    echo "qemu-omniosk: FAIL (exit status $status; success is 127, reset is 0)" >&2
+    cat "$log" >&2
+    exit 1
+fi
+if ! grep -q "RING SMOKE PASS" "$log"; then
+    echo "qemu-omniosk: FAIL (no PASS marker in serial)" >&2
+    cat "$log" >&2
+    exit 1
+fi
+echo "qemu-omniosk: OK"

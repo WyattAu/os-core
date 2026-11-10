@@ -717,9 +717,6 @@ dependencies = [
 [[package]]
 name = "omniosk"
 version = "0.1.0"
-dependencies = [
- "omni-ring",
-]
 
 [[package]]
 name = "once_cell"

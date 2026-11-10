@@ -12,7 +12,6 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
-omni-ring = { workspace = true }
 
 [features]
 default = []

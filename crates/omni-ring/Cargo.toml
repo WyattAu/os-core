@@ -12,7 +12,7 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
-crossbeam-queue = { workspace = true }
+crossbeam-queue = { workspace = true, optional = true }
 loom = { version = "0.7", optional = true }
 
 [dev-dependencies]
@@ -20,7 +20,10 @@ criterion = { workspace = true }
 proptest = { workspace = true }
 
 [features]
-default = []
+default = ["mpmc"]
+# Lock-free MPMC via crossbeam (std). The no_std/no-alloc kernel build
+# opts out and uses the SPSC ring only (ADR-0013).
+mpmc = ["dep:crossbeam-queue"]
 # Model-checking double for CI's loom leg (estate rust-kit `loom: true`).
 loom = ["dep:loom"]
 
