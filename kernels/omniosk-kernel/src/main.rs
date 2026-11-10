@@ -228,10 +228,30 @@ extern "C" fn kernel_main() -> ! {
         qemu_exit(&mut ports, 33);
     }
 
+    // Phase 2: wraparound. The cursors cross the slot-mask boundary
+    // (16 descriptors through an 8-slot ring), exercising slot reuse —
+    // the exact case the orderings exist for.
+    let mut wrapped = true;
+    for v in 9..=16_u64 {
+        if ring.try_push(v).is_some() {
+            wrapped = false;
+        }
+    }
+    for v in 9..=16_u64 {
+        if ring.try_pop() != Some(v) {
+            wrapped = false;
+        }
+    }
+    if !wrapped {
+        uart.write_str("RING WRAP FAIL\n");
+        qemu_exit(&mut ports, 33);
+    }
+
     // Success signature: isa-debug-exit maps the guest byte (63 here,
     // written by qemu_exit's (v<<1)|1 encoding) to host exit
     // ((byte << 1) | 1) & 0xFF = 127 — distinct from triple-fault reset,
     // which is 0 with -no-reboot.
+    uart.write_str("RING WRAP PASS\n");
     uart.write_str("RING SMOKE PASS\n");
     uart.write_str("HALT (tickless idle)\n");
     qemu_exit(&mut ports, 31)

@@ -38,9 +38,11 @@ if [ "$status" -ne 127 ]; then
     cat "$log" >&2
     exit 1
 fi
-if ! grep -q "RING SMOKE PASS" "$log"; then
-    echo "qemu-omniosk: FAIL (no PASS marker in serial)" >&2
-    cat "$log" >&2
-    exit 1
-fi
+for marker in "OMNIOSK UP" "RING WRAP PASS" "RING SMOKE PASS"; do
+    grep -q "$marker" "$log" || {
+        echo "qemu-omniosk: FAIL (serial missing '$marker')" >&2
+        cat "$log" >&2
+        exit 1
+    }
+done
 echo "qemu-omniosk: OK"

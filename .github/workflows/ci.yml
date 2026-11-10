@@ -33,10 +33,9 @@ jobs:
       coverage-ignore-regex: xtask/src|omni-service/src/main.rs
 
   # REQ-OS-005 / ADR-0013: boots omniosk-kernel (PVH -> long mode) in QEMU
-  # and asserts the verified-ring smoke over serial. Advisory first;
-  # graduates to blocking after one clean loop (LOOP.md policy).
+  # and asserts the verified-ring smoke over serial. Blocking: green in its
+  # first runner run (42762333150) per the LOOP.md one-clean-loop policy.
   qemu-smoke:
-    continue-on-error: true
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
