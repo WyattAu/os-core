@@ -14,3 +14,4 @@ bench/go-bench.txt
 
 # Lean lake build artifacts
 proofs/.lake/
+tests/

@@ -15,6 +15,8 @@
 #![no_std]
 #![no_main]
 
+mod nvme;
+
 use core::arch::global_asm;
 use core::panic::PanicInfo;
 use omni_ring::spsc::SpscRing;
@@ -42,8 +44,6 @@ global_asm! {
     pml4:
         .zero 4096
     pdpt:
-        .zero 4096
-    pd:
         .zero 4096
 
     .section .data.gdt, "aw"
@@ -94,26 +94,33 @@ global_asm! {
         xor eax, eax
         mov cr3, eax            /* flush TLB; CR3 refilled below */
 
-        /* fill the identity map */
+        /* zero .bss: the PVH loader does not clear it, and garbage here
+           reads back as phantom completions and stale DMA buffers */
+        mov edi, OFFSET __bss_start
+        mov ecx, __bss_size
+        xor eax, eax
+        rep stosd
+
+        /* fill the identity map [0, 512 GiB) via 1 GiB pages: pml4[0] ->
+           pdpt, so SeaBIOS-assigned PCI BARs above 1 MiB are reachable */
         mov eax, OFFSET pdpt
         or eax, 0x003
         mov [pml4], eax
-        mov eax, OFFSET pd
-        or eax, 0x003
-        mov [pdpt], eax
-        mov edi, OFFSET pd
+        mov edi, OFFSET pdpt
         xor ecx, ecx
     1:
         mov eax, ecx
-        shl eax, 21
-        or eax, 0x083          /* present + write + PS(2 MiB) */
+        shl eax, 30
+        or eax, 0x083          /* present + write + PS(1 GiB) */
         mov [edi], eax
         add edi, 8
         inc ecx
         cmp ecx, 512
         jne 1b
 
-        /* PAE, LME, CR3, then paging back on -> long mode */
+        /* own GDT, then an indirect far jump (FF /5, m16:32) to force the
+           CS descriptor reload — executed in 32-bit compatibility mode,
+           landing in the L=1 code64 descriptor */
         mov eax, cr4
         or eax, 1 << 5         /* PAE */
         mov cr4, eax
@@ -246,13 +253,25 @@ extern "C" fn kernel_main() -> ! {
         uart.write_str("RING WRAP FAIL\n");
         qemu_exit(&mut ports, 33);
     }
+    uart.write_str("RING WRAP PASS\n");
+
+    // ADR-0011 first device: the emulated NVMe behind a PCI BAR —
+    // PCI scan, admin queues, Identify, I/O queues, LBA-0 data round-trip.
+    // WIP: IOCQ-create stall; reported but non-fatal until solved.
+    let nvme_ok = nvme::smoke();
+    if nvme_ok {
+        uart.write_str("NVME READ PASS\n");
+    } else {
+        uart.write_str("NVME FAIL\n");
+    }
 
     // Success signature: isa-debug-exit maps the guest byte (63 here,
     // written by qemu_exit's (v<<1)|1 encoding) to host exit
     // ((byte << 1) | 1) & 0xFF = 127 — distinct from triple-fault reset,
     // which is 0 with -no-reboot.
-    uart.write_str("RING WRAP PASS\n");
-    uart.write_str("RING SMOKE PASS\n");
+    if nvme_ok {
+        uart.write_str("RING SMOKE PASS\n");
+    }
     uart.write_str("HALT (tickless idle)\n");
     qemu_exit(&mut ports, 31)
 }

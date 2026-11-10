@@ -24,8 +24,11 @@ SECTIONS
     }
 
     .bss : {
+        __bss_start = .;
         *(COMMON)
         *(.bss .bss.*)
+        __bss_end = .;
+        __bss_size = (__bss_end - __bss_start + 3) & ~3;
     }
 
     /DISCARD/ : {
