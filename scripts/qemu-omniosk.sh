@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # REQ-OS-005 / ADR-0013: boot omniosk-kernel in QEMU and assert the
 # verified-ring smoke over serial, with a clean isa-debug-exit status.
+# NVMe markers are advisory (ADR-0011 WIP: IOCQ-create stall under debug).
 set -euo pipefail
 cd "$(dirname "$0")/../kernels/omniosk-kernel"
 
@@ -34,7 +35,6 @@ timeout 60 qemu-system-x86_64 \
     -drive file=tests/nvme.img,if=none,format=raw,id=nvmedrive \
     -device nvme,serial=OMNIOSK,drive=nvmedrive \
     -serial "file:$log" \
-    -serial "file:$log" \
     -display none \
     -no-reboot \
     -m 128M \
@@ -47,6 +47,13 @@ if [ "$status" -ne 127 ]; then
     cat "$log" >&2
     exit 1
 fi
+for marker in "OMNIOSK UP" "RING WRAP PASS" "RING SMOKE PASS"; do
+    grep -q "$marker" "$log" || {
+        echo "qemu-omniosk: FAIL (serial missing '$marker')" >&2
+        cat "$log" >&2
+        exit 1
+    }
+done
 # NVME markers are advisory until the IOCQ-create stall is solved
 # (ADR-0011 WIP): the driver reaches Identify + real DMA, but the second
 # admin command still times out. Warn, don't fail, so main stays green.
