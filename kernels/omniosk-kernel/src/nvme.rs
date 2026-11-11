@@ -151,7 +151,8 @@ pub fn smoke() -> bool {
     mmio32w(bar, 0x24, ((QSIZE as u32 - 1) << 16) | (QSIZE as u32 - 1)); // AQA
     mmio64w(bar, 0x28, asq as u64); // ASQ
     mmio64w(bar, 0x30, acq as u64); // ACQ
-    mmio32w(bar, 0x14, (6 << 16) | (6 << 20) | 1); // CC: EN=1, 64B entries
+    // CC: IOSQES = 6 (64B SQEs), IOCQES = 4 (16B CQEs), EN = 1.
+    mmio32w(bar, 0x14, (6 << 16) | (4 << 20) | 1);
     spins = 0;
     while mmio32(bar, 0x1C) & 1 == 0 {
         spins += 1;
