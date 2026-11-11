@@ -8,8 +8,6 @@ linker = "rust-lld"
 rustflags = [
     "-C", "link-arg=-T",
     "-C", "link-arg=kern.ld",
-    "-C", "link-arg=--nmagic",
-    "-C", "link-arg=--no-relax",
     "-C", "link-arg=--no-pie",
     "-C", "link-arg=-static",
 ]

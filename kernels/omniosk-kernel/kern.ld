@@ -23,10 +23,11 @@ SECTIONS
         *(.data .data.*)
     }
 
-    .bss : {
+    .bss : ALIGN(4096) {
         __bss_start = .;
         *(COMMON)
         *(.bss .bss.*)
+        . = ALIGN(4096);
         __bss_end = .;
         __bss_size = (__bss_end - __bss_start + 3) & ~3;
     }
