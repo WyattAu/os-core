@@ -156,12 +156,12 @@ pub fn smoke() -> bool {
     }
 
     // SAFETY (package boundary, ADR-0013): DMA target buffers, statics.
-    let asq = unsafe { core::ptr::addr_of!(ADMIN_SQ) } as usize;
-    let acq = unsafe { core::ptr::addr_of!(ADMIN_CQ) } as usize;
-    let ident = unsafe { core::ptr::addr_of!(IDENT_BUF) } as usize;
-    let readb = unsafe { core::ptr::addr_of!(READ_BUF) } as usize;
-    let iosq = unsafe { core::ptr::addr_of!(IO_SQ) } as usize;
-    let iocq = unsafe { core::ptr::addr_of!(IO_CQ) } as usize;
+    let asq = core::ptr::addr_of!(ADMIN_SQ) as usize;
+    let acq = core::ptr::addr_of!(ADMIN_CQ) as usize;
+    let ident = core::ptr::addr_of!(IDENT_BUF) as usize;
+    let readb = core::ptr::addr_of!(READ_BUF) as usize;
+    let iosq = core::ptr::addr_of!(IO_SQ) as usize;
+    let iocq = core::ptr::addr_of!(IO_CQ) as usize;
 
     mmio32w(bar, 0x24, ((QSIZE as u32 - 1) << 16) | (QSIZE as u32 - 1)); // AQA
     mmio64w(bar, 0x28, asq as u64); // ASQ
