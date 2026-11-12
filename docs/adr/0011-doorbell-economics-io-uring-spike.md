@@ -22,6 +22,11 @@ spike (`spikes/io-spike`, `scripts/io-spike.sh`, results in
    user-side submit becomes a memory write). It is privilege-gated, so
    K2 targets it on dedicated/partitioned hosts only, as a follow-up
    spike on isolated cores.
+   - **Follow-up (2026-11-12)**: executed on the shared fleet host with
+     taskset pinning only — SQPOLL measured 3-4× *worse* than batched
+     enter (docs/bench/2026-11-12-sqpoll-spike.md). Index-line bouncing
+     between app core and poller thread eats the saved syscall. The
+     isolation requirement is now empirical, not assumed.
 3. **DPDK is deferred to Phase 2** (FPGA beachhead): it needs a real NIC
    and hugepage reservation; without the wire it measures nothing the
    io_uring numbers didn't already teach.
