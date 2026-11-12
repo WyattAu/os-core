@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # REQ-OS-005 / ADR-0013: boot omniosk-kernel in QEMU and assert the
 # verified-ring smoke over serial, with a clean isa-debug-exit status.
-# NVMe markers are advisory (ADR-0011 WIP: IOCQ-create stall under debug).
+# NVMe markers are REQUIRED (full NVMe driver path: identify -> IO queues -> read).
 set -euo pipefail
 cd "$(dirname "$0")/../kernels/omniosk-kernel"
 
@@ -54,9 +54,8 @@ for marker in "OMNIOSK UP" "RING WRAP PASS" "RING SMOKE PASS"; do
         exit 1
     }
 done
-# NVME markers are advisory until the IOCQ-create stall is solved
-# (ADR-0011 WIP): the driver reaches Identify + real DMA, but the second
-# admin command still times out. Warn, don't fail, so main stays green.
+# NVMe markers are REQUIRED: the driver completes the full path (PCI
+# scan -> controller init -> Identify -> Create IOCQ/IOSQ -> DMA read).
 nvme_missing=0
 for marker in "NVME IDENT PASS" "NVME READ PASS"; do
     grep -q "$marker" "$log" || {
@@ -64,4 +63,5 @@ for marker in "NVME IDENT PASS" "NVME READ PASS"; do
         nvme_missing=1
     }
 done
+[ "$nvme_missing" -eq 1 ] && exit 1
 echo "qemu-omniosk: OK"

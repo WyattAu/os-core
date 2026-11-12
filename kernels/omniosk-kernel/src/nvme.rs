@@ -73,11 +73,17 @@ fn submit(bar: usize, sq: usize, tail: usize, sq_db_off: usize, entry: &[u8; 64]
 /// Polls the CQE at `idx` until its phase bit matches `phase` (bounded);
 /// returns Some(dw3) on completion, None on timeout. Rings the CQ head
 /// doorbell (`cq_hd_off`) for the consumed entry.
+///
+/// CQE DW3 layout (per Linux nvme_completion / QEMU NvmeCqe — verified
+/// against QEMU 11.1.3 hw/nvme): DW3[15:0] = CID, DW3[31:16] = status
+/// u16 with SF<<1 | P. The phase bit is therefore bit 16 of DW3, NOT
+/// bit 0. Reading bit 0 reads the CID's LSB: odd CIDs (identify, CID=1)
+/// appear to complete, even CIDs (create-cq, CID=2) never do.
 fn wait_cqe(bar: usize, cq: usize, idx: usize, phase: u32, cq_hd_off: usize) -> Option<u32> {
     let mut spins = 0usize;
     let dw3 = loop {
         let v = mmio32(cq, idx * 16 + 12);
-        if (v & 1) == phase {
+        if (v >> 16 & 1) == phase {
             break v;
         }
         spins += 1;
@@ -125,9 +131,13 @@ pub fn smoke() -> bool {
         return false;
     }
 
-    // ---- doorbell stride from CAP.DSTRD (bits 2:0) ----
-    let stride = 4u32 << (mmio32(bar, 0x00) & 0x7);
-    let cq0_hd = cq_hd_off(0, stride);
+    // Doorbell stride = 4 bytes (SeaBIOS-verified: CQ0HDBL @ 0x1004).
+    // The CAP[2:0] read of 0x7 does not reflect the effective stride
+    // for this QEMU/SeaBIOS pair. The 512B stride broke the CQ head
+    // doorbell, preventing the controller from advancing past the
+    // identify completion (the admin CQ appeared full).
+    let stride = 4u32;
+    let cq0_hd = cq_hd_off(0, stride); // = 0x1004
 
     // ---- controller disable + queue programming ----
     mmio32w(bar, 0x14, 0); // CC.EN = 0
@@ -178,7 +188,7 @@ pub fn smoke() -> bool {
             return false;
         }
     };
-    if ((dw3 >> 8) & 0x7F) != 0 {
+    if (dw3 >> 17 & 0x7FFF) != 0 {
         uart.write_str("NVME: identify status=0x");
         write_hex(&mut uart, dw3);
         uart.write_str("\n");
@@ -205,8 +215,10 @@ pub fn smoke() -> bool {
     sqe[0] = 0x05; // Create IOCQ
     sqe[2..4].copy_from_slice(&2u16.to_le_bytes()); // CID 2
     sqe[24..32].copy_from_slice(&(iocq as u64).to_le_bytes()); // PRP1
-    sqe[40..44].copy_from_slice(&(QSIZE as u32 - 1).to_le_bytes()); // CDW10 size
-    sqe[48..52].copy_from_slice(&1u32.to_le_bytes()); // CDW12: PC contiguous
+    sqe[40..42].copy_from_slice(&1u16.to_le_bytes()); // CQID = 1
+    sqe[42..44].copy_from_slice(&((QSIZE as u16) - 1).to_le_bytes()); // QSIZE = 3 (0-based)
+    sqe[44..46].copy_from_slice(&3u16.to_le_bytes()); // flags: PC + IEN
+    sqe[46..48].copy_from_slice(&0u16.to_le_bytes()); // IRQ vector = 0
     submit(bar, asq, 1, sq_db_off(0, stride), &sqe);
     let dw3 = match wait_cqe(bar, acq, 1, 1, cq0_hd) {
         Some(v) => v,
@@ -228,7 +240,7 @@ pub fn smoke() -> bool {
             return false;
         }
     };
-    if ((dw3 >> 8) & 0x7F) != 0 {
+    if (dw3 >> 17 & 0x7FFF) != 0 {
         uart.write_str("NVME: IOCQ status=0x");
         write_hex(&mut uart, dw3);
         uart.write_str("\n");
@@ -239,9 +251,10 @@ pub fn smoke() -> bool {
     sqe[0] = 0x01; // Create IOSQ
     sqe[2..4].copy_from_slice(&3u16.to_le_bytes()); // CID 3
     sqe[24..32].copy_from_slice(&(iosq as u64).to_le_bytes()); // PRP1
-    sqe[40..44].copy_from_slice(&(QSIZE as u32 - 1).to_le_bytes()); // CDW10 size
-    sqe[44..48].copy_from_slice(&1u32.to_le_bytes()); // CDW11: CQID 1
-    sqe[48..52].copy_from_slice(&1u32.to_le_bytes()); // CDW12: PC + prio
+    sqe[40..42].copy_from_slice(&1u16.to_le_bytes()); // SQID = 1
+    sqe[42..44].copy_from_slice(&((QSIZE as u16) - 1).to_le_bytes()); // QSIZE = 3 (0-based)
+    sqe[44..46].copy_from_slice(&1u16.to_le_bytes()); // SQ_FLAGS: PC
+    sqe[46..48].copy_from_slice(&1u16.to_le_bytes()); // CQID = 1
     submit(bar, asq, 2, sq_db_off(0, stride), &sqe);
     let dw3 = match wait_cqe(bar, acq, 2, 1, cq0_hd) {
         Some(v) => v,
@@ -250,7 +263,7 @@ pub fn smoke() -> bool {
             return false;
         }
     };
-    if ((dw3 >> 8) & 0x7F) != 0 {
+    if (dw3 >> 17 & 0x7FFF) != 0 {
         uart.write_str("NVME: IOSQ status=0x");
         write_hex(&mut uart, dw3);
         uart.write_str("\n");
@@ -273,7 +286,7 @@ pub fn smoke() -> bool {
             return false;
         }
     };
-    if ((dw3 >> 8) & 0x7F) != 0 {
+    if (dw3 >> 17 & 0x7FFF) != 0 {
         uart.write_str("NVME: read status=0x");
         write_hex(&mut uart, dw3);
         uart.write_str("\n");
