@@ -16,3 +16,4 @@ bench/go-bench.txt
 proofs/.lake/
 tests/
 kernels/omniosk-kernel/trace.log
+kernels/omniosk-kernel/tests/serial.log

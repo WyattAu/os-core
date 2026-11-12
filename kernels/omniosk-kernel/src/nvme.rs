@@ -4,8 +4,8 @@
 //! assigned its BAR0 before the handoff, covered by the boot identity map
 //! (512 GiB of 1 GiB pages). The driver speaks raw NVMe over MMIO:
 //! disable controller, program the admin queues, Identify (model printed
-//! over COM1), create I/O queues, read LBA 0, and verify the drive's data
-//! actually round-tripped.
+//! over COM1), create I/O queues, read LBA 0, write a pattern to LBA 1,
+//! read it back, and verify the drive's data actually round-tripped.
 //!
 //! Everything here is `unsafe` by package policy (ADR-0013 boundary).
 
@@ -49,6 +49,11 @@ fn mmio64w(base: usize, off: usize, v: u64) {
 #[inline]
 fn vbyte(base: usize, off: usize) -> u8 {
     unsafe { core::ptr::read_volatile((base + off) as *const u8) }
+}
+
+#[inline]
+fn wbyte(base: usize, off: usize, v: u8) {
+    unsafe { core::ptr::write_volatile((base + off) as *mut u8, v) }
 }
 
 /// 32-bit PCI configuration read through 0xCF8/0xCFC (bus 0).
@@ -299,6 +304,69 @@ pub fn smoke() -> bool {
             return false;
         }
     }
+
+    // ---- I/O: WRITE a pattern to LBA 1, read it back, verify (REQ-OS-006) ----
+    // Fill the scratch page with a known pattern, write one block to
+    // LBA 1, zero the page, read LBA 1 back, compare. Proves the full
+    // block path: data flows device-ward through the I/O SQ and back.
+    const WRT_MAGIC: &[u8] = b"OMNIOSK-WRT-OK!";
+    for (i, b) in WRT_MAGIC.iter().enumerate() {
+        wbyte(readb, i, *b);
+    }
+    let mut sqe = [0u8; 64];
+    sqe[0] = 0x01; // Write
+    sqe[2..4].copy_from_slice(&5u16.to_le_bytes()); // CID 5
+    sqe[4..8].copy_from_slice(&1u32.to_le_bytes()); // NSID 1
+    sqe[24..32].copy_from_slice(&(readb as u64).to_le_bytes()); // PRP1
+    sqe[40..44].copy_from_slice(&1u32.to_le_bytes()); // CDW10: SLBA lo = 1
+    sqe[48..52].copy_from_slice(&0u32.to_le_bytes()); // CDW12: NLB-1 = 0
+    submit(bar, iosq, 1, sq_db_off(1, stride), &sqe);
+    let dw3 = match wait_cqe(bar, iocq, 1, 1, cq_hd_off(1, stride)) {
+        Some(v) => v,
+        None => {
+            uart.write_str("NVME: write timeout\n");
+            return false;
+        }
+    };
+    if (dw3 >> 17 & 0x7FFF) != 0 {
+        uart.write_str("NVME: write status=0x");
+        write_hex(&mut uart, dw3);
+        uart.write_str("\n");
+        return false;
+    }
+
+    // Zero the scratch page, then read LBA 1 back and compare.
+    for i in 0..WRT_MAGIC.len() {
+        wbyte(readb, i, 0);
+    }
+    let mut sqe = [0u8; 64];
+    sqe[0] = 0x02; // Read
+    sqe[2..4].copy_from_slice(&6u16.to_le_bytes()); // CID 6
+    sqe[4..8].copy_from_slice(&1u32.to_le_bytes()); // NSID 1
+    sqe[24..32].copy_from_slice(&(readb as u64).to_le_bytes()); // PRP1
+    sqe[40..44].copy_from_slice(&1u32.to_le_bytes()); // CDW10: SLBA lo = 1
+    sqe[48..52].copy_from_slice(&0u32.to_le_bytes()); // CDW12: NLB-1 = 0
+    submit(bar, iosq, 2, sq_db_off(1, stride), &sqe);
+    let dw3 = match wait_cqe(bar, iocq, 2, 1, cq_hd_off(1, stride)) {
+        Some(v) => v,
+        None => {
+            uart.write_str("NVME: write-verify read timeout\n");
+            return false;
+        }
+    };
+    if (dw3 >> 17 & 0x7FFF) != 0 {
+        uart.write_str("NVME: write-verify status=0x");
+        write_hex(&mut uart, dw3);
+        uart.write_str("\n");
+        return false;
+    }
+    for (i, expected) in WRT_MAGIC.iter().enumerate() {
+        if vbyte(readb, i) != *expected {
+            uart.write_str("NVME: write data mismatch\n");
+            return false;
+        }
+    }
+    uart.write_str("NVME WRITE PASS\n");
     true
 }
 
