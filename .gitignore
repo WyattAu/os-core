@@ -15,3 +15,4 @@ bench/go-bench.txt
 # Lean lake build artifacts
 proofs/.lake/
 tests/
+kernels/omniosk-kernel/trace.log
