@@ -13,6 +13,7 @@ unsafe_code = "allow"
 [dependencies]
 omniosk = { path = "../../crates/omniosk" }
 omni-ring = { path = "../../crates/omni-ring", default-features = false }
+omni-heap = { path = "../../crates/omni-heap" }
 
 [profile.release]
 panic = "abort"

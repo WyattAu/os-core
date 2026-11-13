@@ -38,6 +38,16 @@ global_asm! {
         .asciz "Xen"
         .long _start
 
+    /* PVH handoff pointer: ESI at the 32-bit entry = &hvm_start_info
+       (Xen PVH abi; QEMU fills it with the e820-style memory map).
+       Saved into .data — NOT .bss, which the trampoline zeroes after
+       this store would already have been wiped. */
+    .section .data.memmap, "aw"
+    .align 4
+    .global pvh_info_ptr
+    pvh_info_ptr:
+        .long 0
+
     /* identity page tables: pml4[0] -> pdpt[0] -> pd (512 * 2 MiB = 1 GiB) */
     .section .data.page_tables, "aw"
     .align 4096
@@ -84,6 +94,8 @@ global_asm! {
     _start:
         cli
         cld
+        /* save the PVH handoff pointer before anything clobbers ESI */
+        mov [pvh_info_ptr], esi
         mov esp, OFFSET boot_stack_bottom
         add esp, 0x4000          /* top of the 16 KiB boot stack */
 
@@ -160,6 +172,203 @@ global_asm! {
     "#
 }
 
+// ---- PVH memory map + heap (REQ-OS-005 seam, REQ-OS-007 consumer) ----
+
+use omni_heap::PAGE_SIZE;
+
+extern "C" {
+    /// Written by the trampoline: ESI at the PVH 32-bit entry, i.e. the
+    /// physical address of the `hvm_start_info` struct.
+    static pvh_info_ptr: u32;
+    /// Linker-script symbol (kern.ld): end of the kernel image.
+    static __bss_end: u8;
+}
+
+/// Bitmap backing for the microcore heap: 512 words -> 32,768 pages
+/// (128 MiB) maximum. Lives in .bss, zeroed by the trampoline.
+const HEAP_BITMAP_WORDS: usize = 512;
+const HEAP_MAX_PAGES: usize = HEAP_BITMAP_WORDS * 64;
+static mut HEAP_BITMAP: [u64; HEAP_BITMAP_WORDS] = [0; HEAP_BITMAP_WORDS];
+
+const PVH_MAGIC: u32 = 0x336ec578;
+
+/// Locates `hvm_start_info`: trusts the trampoline-latched ESI when it
+/// points at a valid struct, else scans conventional low memory for the
+/// magic. DISCOVERY (2026-11-13): with QEMU 11.1.3's SeaBIOS, ESI at the
+/// PVH entry parks at 0x560 but the real struct is a SeaBIOS low-malloc
+/// elsewhere (found at 0x1580) — the spec pointer cannot be trusted.
+fn pvh_info_base() -> Option<usize> {
+    let ptr = unsafe { core::ptr::addr_of!(pvh_info_ptr).read_volatile() } as usize;
+    let magic_le = PVH_MAGIC.to_le_bytes();
+    let magic_at = |off: usize| -> bool {
+        if off < 4 {
+            return false;
+        }
+        for (k, eb) in magic_le.iter().enumerate() {
+            // SAFETY: fixed-offset byte reads inside mapped low RAM /
+            // the SeaBIOS f-segment; same boundary as nvme.rs MMIO reads.
+            let vb = unsafe { ((off + k) as *const u8).read_volatile() };
+            if vb != *eb {
+                return false;
+            }
+        }
+        true
+    };
+    if ptr != 0 && magic_at(ptr) {
+        return Some(ptr);
+    }
+    let ranges = [(0x400usize, 0x9FC00usize), (0xF0000usize, 0x100000usize)];
+    for (lo, hi) in ranges {
+        for off in (lo..hi).step_by(4) {
+            if magic_at(off) {
+                return Some(off);
+            }
+        }
+    }
+    None
+}
+
+/// Reads `hvm_start_info` (Xen PVH abi, filled by SeaBIOS): returns
+/// `(memmap_paddr, memmap_entries)` or None if the struct is absent.
+fn pvh_memmap() -> Option<(usize, u32)> {
+    let base = pvh_info_base()?;
+    let p = base as *const u32;
+    // SAFETY: hvm_start_info is 32 bytes of plain u32/u64 fields; the
+    // reads use the documented offsets (magic 0, memmap_entries 28,
+    // memmap_paddr 32). read_volatile keeps the compiler from inventing
+    // wider loads than the field reads.
+    unsafe {
+        let entries = p.add(7).read_volatile();
+        let map_paddr = p.add(8).read_volatile();
+        Some((map_paddr as usize, entries))
+    }
+}
+
+/// Picks the largest RAM (e820 type 1) region that starts above the
+/// kernel image, returning `(heap_base, pages)` capped to the bitmap.
+fn best_ram_above(min_addr: usize) -> Option<(usize, usize)> {
+    let (map_paddr, entries) = pvh_memmap()?;
+    let mut best: Option<(usize, usize)> = None;
+    for i in 0..entries as usize {
+        let e = map_paddr + i * 24; // hvm_memmap_table_entry is 24 bytes
+        // SAFETY: fixed-offset field reads inside the memmap table;
+        // see the SAFETY note in pvh_memmap.
+        let (rtype, paddr, length) = unsafe {
+            let t = (e as *const u32).read_volatile();
+            let p = ((e + 8) as *const u64).read_volatile() as usize;
+            let l = ((e + 16) as *const u64).read_volatile() as usize;
+            (t, p, l)
+        };
+        if rtype != 1 {
+            continue; // e820 RAM only
+        }
+        let start = paddr.max(min_addr).div_ceil(PAGE_SIZE) * PAGE_SIZE;
+        let end = paddr.saturating_add(length);
+        if start >= end {
+            continue;
+        }
+        let pages = (end - start) / PAGE_SIZE;
+        if pages == 0 {
+            continue;
+        }
+        if best.map(|(_, p)| pages > p).unwrap_or(true) {
+            best = Some((start, pages));
+        }
+    }
+    best
+}
+
+/// Carves the heap out of the PVH memory map and smoke-tests it:
+/// allocate two pages, free the first, and require first-fit to hand
+/// it straight back. Any violation prints HEAP FAIL (and the marker
+/// gate in scripts/qemu-omniosk.sh turns red).
+fn heap_init(uart: &mut Serial<RawPorts>) -> bool {
+    use omni_heap::PAGE_SIZE;
+
+    // &__bss_end as an address: the linker symbol, not the pointee.
+    let bss_end = unsafe { core::ptr::addr_of!(__bss_end) } as usize;
+    let Some((base, pages)) = best_ram_above(bss_end) else {
+        // Firmware (this SeaBIOS build) leaves hvm_start_info.memmap
+        // empty. Fall back to a conservative 16 MiB heap directly above
+        // the kernel image — safe for any QEMU -m >= 32M, and the
+        // firmware can never hand that range to anyone else: it sits
+        // inside the region QEMU reports as RAM and below the ACPI
+        // reservation at the top of low memory.
+        let start = bss_end.div_ceil(PAGE_SIZE) * PAGE_SIZE;
+        uart.write_str("heap: memmap empty, conservative 16 MiB @ ");
+        write_hex32(uart, start as u32);
+        uart.write_str("\n");
+        return heap_smoke(uart, start, (16 << 20) / PAGE_SIZE);
+    };
+    heap_smoke(uart, base, pages.min(HEAP_MAX_PAGES))
+}
+
+fn heap_smoke(uart: &mut Serial<RawPorts>, base: usize, pages: usize) -> bool {
+    use omni_heap::PageAlloc;
+    let pages = pages.min(HEAP_MAX_PAGES);
+
+    // SAFETY: single-threaded boot context; HEAP_BITMAP is the sole
+    // owner of the bitmap words (same static-mut pattern as nvme.rs).
+    // The slice reassembly cannot produce None (fixed non-zero length);
+    // on the impossible path the boot halts (no_std: no std::abort).
+    let bitmap: &'static mut [u64] = match unsafe {
+        (core::ptr::slice_from_raw_parts_mut(
+            core::ptr::addr_of_mut!(HEAP_BITMAP).cast::<u64>(),
+            HEAP_BITMAP_WORDS,
+        ))
+        .as_mut()
+    } {
+        Some(s) => s,
+        // The slice reassembly cannot produce None (fixed non-zero
+        // length); on the impossible path the boot halts via the
+        // kernel's panic handler (panic = abort).
+        None => panic!("bitmap reassembly is infallible"),
+    };
+    let Ok(mut heap) = PageAlloc::new(base, pages, bitmap) else {
+        uart.write_str("heap: layout rejected\n");
+        return false;
+    };
+
+    let Ok(a) = heap.alloc() else {
+        uart.write_str("heap: alloc 1 failed\n");
+        return false;
+    };
+    let Ok(b) = heap.alloc() else {
+        uart.write_str("heap: alloc 2 failed\n");
+        return false;
+    };
+    if a % PAGE_SIZE != 0
+        || b != a + PAGE_SIZE
+        || a < base
+        || a >= base + pages * PAGE_SIZE
+    {
+        uart.write_str("heap: layout invariant violated\n");
+        return false;
+    }
+    if heap.free(a) != Ok(()) {
+        uart.write_str("heap: free 1 failed\n");
+        return false;
+    }
+    // First-fit determinism on real hardware: the freed page must come
+    // straight back.
+    if heap.alloc() != Ok(a) {
+        uart.write_str("heap: realloc != first-fit\n");
+        return false;
+    }
+    let _ = b;
+    true
+}
+
+/// Writes a 32-bit value as 8 hex nibbles over the serial port.
+fn write_hex32(uart: &mut Serial<RawPorts>, v: u32) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for shift in (0..32).step_by(4).rev() {
+        let nib = ((v >> shift) & 0xF) as usize;
+        let byte = [HEX[nib]];
+        uart.write_str(core::str::from_utf8(&byte).unwrap_or("?"));
+    }
+}
+
 /// THE unsafe boundary of the os-core program (ADR-0013): raw `in`/`out`.
 struct RawPorts;
 
@@ -215,6 +424,15 @@ extern "C" fn kernel_main() -> ! {
     let mut uart = Serial::new(RawPorts, COM1);
     uart.init(1);
     uart.write_str("OMNIOSK UP (PVH -> long mode)\n");
+
+    // ---- heap: carve the microcore heap from the PVH memory map ----
+    // (REQ-OS-007; REQ-OS-005 boot-protocol seam). See heap_init below.
+    let heap_ok = heap_init(&mut uart);
+    if heap_ok {
+        uart.write_str("HEAP PASS\n");
+    } else {
+        uart.write_str("HEAP FAIL\n");
+    }
 
     // The keystone moment: the Lean-proved descriptor ring, bare metal.
     let ring: SpscRing<8> = SpscRing::new();
