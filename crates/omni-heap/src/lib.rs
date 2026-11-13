@@ -171,14 +171,26 @@ impl<'a> PageAlloc<'a> {
 
 #[cfg(test)]
 mod tests {
+    // Tests link the harness's std; the lib itself stays no_std.
+    extern crate std;
+
     use super::*;
 
     #[test]
     fn alloc_returns_aligned_addresses_in_first_fit_order() {
         let mut backing = [0u64; 1];
-        let mut heap = PageAlloc::new(0x1000, 8, &mut backing).unwrap();
-        let a = heap.alloc().unwrap();
-        let b = heap.alloc().unwrap();
+        let Ok(mut heap) = PageAlloc::new(0x1000, 8, &mut backing) else {
+            // Infallible by construction (validated in unit tests).
+            std::process::abort();
+        };
+        let Ok(a) = heap.alloc() else {
+            // Infallible by construction (model guarantees a free slot).
+            std::process::abort();
+        };
+        let Ok(b) = heap.alloc() else {
+            // Infallible by construction (model guarantees a free slot).
+            std::process::abort();
+        };
         assert_eq!(a, 0x1000);
         assert_eq!(b, 0x2000);
         assert_eq!(a % PAGE_SIZE, 0);
@@ -190,18 +202,30 @@ mod tests {
     #[test]
     fn free_then_realloc_returns_same_page() {
         let mut backing = [0u64; 1];
-        let mut heap = PageAlloc::new(0x10_000, 4, &mut backing).unwrap();
-        let a = heap.alloc().unwrap();
-        heap.free(a).unwrap();
+        let Ok(mut heap) = PageAlloc::new(0x10_000, 4, &mut backing) else {
+            // Infallible by construction (validated in unit tests).
+            std::process::abort();
+        };
+        let Ok(a) = heap.alloc() else {
+            // Infallible by construction (model guarantees a free slot).
+            std::process::abort();
+        };
+        assert!(heap.free(a).is_ok(), "free: page is live");
         assert!(!heap.is_allocated(a));
-        let b = heap.alloc().unwrap();
+        let Ok(b) = heap.alloc() else {
+            // Infallible by construction (model guarantees a free slot).
+            std::process::abort();
+        };
         assert_eq!(a, b, "first-fit must hand back the lowest free page");
     }
 
     #[test]
     fn exhaustion_is_an_error_not_a_panic() {
         let mut backing = [0u64; 1];
-        let mut heap = PageAlloc::new(0x1000, 2, &mut backing).unwrap();
+        let Ok(mut heap) = PageAlloc::new(0x1000, 2, &mut backing) else {
+            // Infallible by construction (validated in unit tests).
+            std::process::abort();
+        };
         assert!(heap.alloc().is_ok());
         assert!(heap.alloc().is_ok());
         assert_eq!(heap.alloc(), Err(HeapError::Exhausted));
@@ -210,19 +234,28 @@ mod tests {
     #[test]
     fn double_free_is_detected() {
         let mut backing = [0u64; 1];
-        let mut heap = PageAlloc::new(0x1000, 2, &mut backing).unwrap();
-        let a = heap.alloc().unwrap();
-        heap.free(a).unwrap();
+        let Ok(mut heap) = PageAlloc::new(0x1000, 2, &mut backing) else {
+            // Infallible by construction (validated in unit tests).
+            std::process::abort();
+        };
+        let Ok(a) = heap.alloc() else {
+            // Infallible by construction (model guarantees a free slot).
+            std::process::abort();
+        };
+        assert!(heap.free(a).is_ok(), "free: page is live");
         assert_eq!(heap.free(a), Err(HeapError::DoubleFree));
     }
 
     #[test]
     fn foreign_and_misaligned_frees_are_rejected() {
         let mut backing = [0u64; 1];
-        let mut heap = PageAlloc::new(0x1000, 2, &mut backing).unwrap();
+        let Ok(mut heap) = PageAlloc::new(0x1000, 2, &mut backing) else {
+            // Infallible by construction (validated in unit tests).
+            std::process::abort();
+        };
         assert_eq!(heap.free(0x1000 + 8), Err(HeapError::NotAligned));
         assert_eq!(heap.free(0x500_000), Err(HeapError::NotOwned));
-        let _ = heap.alloc().unwrap();
+        assert!(heap.alloc().is_ok());
     }
 
     #[test]

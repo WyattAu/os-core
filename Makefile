@@ -10,7 +10,9 @@ test:
 	cargo nextest run --workspace --all-features --locked
 
 lint:
-	cargo clippy --workspace --all-features --locked -- -D warnings
+	# --all-targets matches the CI quality job (rust-kit clippy denies
+	# unwrap_used etc. in test targets too, not just the lib surface).
+	cargo clippy --workspace --all-features --all-targets --locked -- -D warnings
 
 fmt:
 	cargo fmt --all
