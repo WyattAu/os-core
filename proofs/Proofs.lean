@@ -102,6 +102,20 @@ theorem nvme_create_cq_qsize_extraction (cqid qsize : Nat)
   exact Nat.eq_of_mul_eq_mul_right
     (show (0 : Nat) < 65536 from by omega) hstep
 
+/-! ### omni-heap page layout (REQ-OS-007)
+
+The allocator hands out `base + idx * PAGE_SIZE` for `idx < pages`
+(first-fit, deterministic). These two contracts are what kernel
+consumers rely on: every page is aligned for an aligned base, and
+every page sits inside the managed range.
+-/
+
+theorem heap_page_aligned (base idx : Nat) (h : base % 4096 = 0) :
+    (base + idx * 4096) % 4096 = 0 := by omega
+
+theorem heap_page_in_range (idx pages : Nat) (h : idx < pages) :
+    idx * 4096 < pages * 4096 := by omega
+
 #print axioms ring_index_bounded
 #print axioms ring_mask_bounded
 #print axioms perm_pack_bounded
@@ -109,3 +123,5 @@ theorem nvme_create_cq_qsize_extraction (cqid qsize : Nat)
 #print axioms nvme_cqe_phase_is_high_half_lsb
 #print axioms nvme_create_cq_cqid_extraction
 #print axioms nvme_create_cq_qsize_extraction
+#print axioms heap_page_aligned
+#print axioms heap_page_in_range

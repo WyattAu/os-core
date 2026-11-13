@@ -34,6 +34,7 @@ first shippable artifacts only.
 | REQ-OS-004 | io_uring/DPDK spike validating doorbell-driven submission idioms on Linux; results recorded as a bench note plus a follow-up ADR | SHOULD |
 | REQ-OS-005 | `omniosk` seed (K4): boot-capable `no_std` library modules (serial `PortIo` seam, qemu-exit, bare-metal ring integration) host-tested under tier-a gates; kernel bin + QEMU harness per ADR-0013 | SHOULD |
 | REQ-OS-006 | NVMe block-write path in `omniosk`: WRITE one block to LBA 1 over the I/O queues, read it back, byte-compare in-kernel; the full block path (read + write + verify) asserted in the QEMU smoke gate | SHOULD |
+| REQ-OS-007 | `omni-heap`: deterministic bitmap page allocator for the microcore — borrowed bitmap (kernel `static` or stack array), `no_std`, panic-free (every failure is a `Result`), first-fit deterministic layout | SHOULD |
 
 ## Traceability Matrix
 
@@ -47,3 +48,4 @@ first shippable artifacts only.
 | REQ-OS-004 | spike bench note + follow-up ADR | empirical |
 | REQ-OS-005 | omniosk unit tests over mock port sink; boot path per ADR-0013 | unit + design |
 | REQ-OS-006 | `NVME WRITE PASS` serial marker, asserted required in `scripts/qemu-omniosk.sh` (write -> read-back -> byte-compare in-kernel) | empirical |
+| REQ-OS-007 | proptest model equivalence (`crates/omni-heap/tests/model.rs`) + `heap_page_aligned` / `heap_page_in_range` Lean theorems | model-checked |

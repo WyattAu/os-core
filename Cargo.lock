@@ -694,6 +694,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "omni-heap"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+]
+
+[[package]]
 name = "omni-ring"
 version = "0.1.0"
 dependencies = [
