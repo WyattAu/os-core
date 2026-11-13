@@ -52,3 +52,27 @@ Run: `taskset -c 4,5 scripts/io-spike.sh 20000`; TSV rows reproduced in
 - **New empirical datum for Pillar X (§82)**: shared-host noise flipped
   a theoretically-winning idiom into a measured loss — the second
   recorded instance after the 2–5× median-vs-min spread.
+
+## Android addendum (2026-11-13): the phone is not an SQPOLL host
+
+A Pixel 10 Pro (Android 17, kernel 6.6.127-android15-8, 8 cores,
+prime @ 3.78 GHz) was proposed as the isolated-CPU host. Deployed via
+adb with a static aarch64-musl build of the same spike binary
+(`/data/local/tmp/io-spike`, pinned with `taskset -c 7`):
+
+- **io_uring is fully blocked in the `shell` domain** —
+  `io_uring_setup` returns EPERM (`uring-1: Permission denied` on all
+  six samples). Android 15+ gates io_uring behind SELinux; the device
+  is a user build (`su` absent, `getenforce` = Enforcing), so there is
+  no escape hatch without rooting.
+- **ARM syscall floor captured anyway** (read(2) per op, 512B,
+  /dev/zero): 195.7 ns/op min at 50k ops on the isolated prime core
+  (272.8 median) vs 113.2 on the x86-64 desktop. This is the first
+  ARM/Android datum for the K2 economics table.
+
+Decision impact: the SQPOLL-on-phone shortcut is closed — the
+isolated-host requirement now means **rootable Linux** (PC with
+isolcpus, or a rooted Android/bricked Linux phone), not a stock
+Android device. The phone remains useful as an ARM syscall-floor
+reference and a future kernel-boot target (it runs a 6.6 mainline-ish
+kernel with 4 KiB pages).
