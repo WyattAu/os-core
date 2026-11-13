@@ -24,7 +24,7 @@
 #![no_std]
 #![deny(unsafe_code)]
 
-/// Page size managed by this allocator (matches the NVMe driver's DMA
+/// Page size managed by this allocator (matches the `NVMe` driver's DMA
 /// pages and x86-64's small-page granularity).
 pub const PAGE_SIZE: usize = 4096;
 
@@ -64,6 +64,11 @@ impl<'a> PageAlloc<'a> {
     /// Manages `[base, base + pages * PAGE_SIZE)`, using `bitmap` as the
     /// allocation map. The base must be page-aligned and the bitmap must
     /// have at least `ceil(pages / 64)` words.
+    ///
+    /// # Errors
+    ///
+    /// [`HeapError::BadLayout`] if the base is misaligned, `pages` is
+    /// zero, or the bitmap is too small for the page count.
     pub fn new(base: usize, pages: usize, bitmap: &'a mut [u64]) -> Result<Self, HeapError> {
         if base % PAGE_SIZE != 0 || pages == 0 || bitmap.len() < pages.div_ceil(64) {
             return Err(HeapError::BadLayout);
@@ -78,6 +83,10 @@ impl<'a> PageAlloc<'a> {
 
     /// Allocates one page: first-fit over an ascending scan, returning
     /// `base + idx * PAGE_SIZE`.
+    ///
+    /// # Errors
+    ///
+    /// [`HeapError::Exhausted`] when no free page remains.
     pub fn alloc(&mut self) -> Result<usize, HeapError> {
         if self.used >= self.pages {
             return Err(HeapError::Exhausted);
@@ -103,6 +112,12 @@ impl<'a> PageAlloc<'a> {
 
     /// Frees a previously allocated page. Misaligned, out-of-range and
     /// double frees are all rejected.
+    ///
+    /// # Errors
+    ///
+    /// [`HeapError::NotAligned`] for a non-page-aligned address,
+    /// [`HeapError::NotOwned`] for an address outside the managed range,
+    /// [`HeapError::DoubleFree`] for a page that is not live.
     pub fn free(&mut self, addr: usize) -> Result<(), HeapError> {
         if addr % PAGE_SIZE != 0 {
             return Err(HeapError::NotAligned);
@@ -113,25 +128,32 @@ impl<'a> PageAlloc<'a> {
         }
         let idx = (addr - self.base) / PAGE_SIZE;
         let (word, bit) = (idx / 64, idx % 64);
-        if self.bitmap[word] & (1 << bit) == 0 {
+        // Unreachable by construction: `new` sized the bitmap for
+        // `pages`, and `idx < pages`. NotOwned is the nearest honest
+        // error if that invariant were ever broken.
+        let bits = self.bitmap.get_mut(word).ok_or(HeapError::NotOwned)?;
+        if *bits & (1 << bit) == 0 {
             return Err(HeapError::DoubleFree);
         }
-        self.bitmap[word] &= !(1 << bit);
+        *bits &= !(1 << bit);
         self.used -= 1;
         Ok(())
     }
 
     /// Pages currently allocated.
+    #[must_use]
     pub fn used_pages(&self) -> usize {
         self.used
     }
 
     /// Pages managed in total.
+    #[must_use]
     pub fn capacity(&self) -> usize {
         self.pages
     }
 
     /// Whether `addr` is a live allocation of this heap.
+    #[must_use]
     pub fn is_allocated(&self, addr: usize) -> bool {
         if addr % PAGE_SIZE != 0 {
             return false;
@@ -141,7 +163,9 @@ impl<'a> PageAlloc<'a> {
             return false;
         }
         let idx = (addr - self.base) / PAGE_SIZE;
-        self.bitmap[idx / 64] & (1 << (idx % 64)) != 0
+        self.bitmap
+            .get(idx / 64)
+            .is_some_and(|w| w & (1 << (idx % 64)) != 0)
     }
 }
 
