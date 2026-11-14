@@ -669,6 +669,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "omni-block"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+]
+
+[[package]]
 name = "omni-cap"
 version = "0.1.0"
 dependencies = [
@@ -720,6 +727,13 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "omni-task"
+version = "0.1.0"
+dependencies = [
+ "proptest",
 ]
 
 [[package]]
