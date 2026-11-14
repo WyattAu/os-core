@@ -116,6 +116,68 @@ theorem heap_page_aligned (base idx : Nat) (h : base % 4096 = 0) :
 theorem heap_page_in_range (idx pages : Nat) (h : idx < pages) :
     idx * 4096 < pages * 4096 := by omega
 
+/-! ### Ring window injectivity (REQ-OS-001, Phase-3 first artifact)
+
+The SPSC ring addresses slot `head & (CAP - 1)` for the `head`-th
+push. FIFO correctness rests on a non-aliasing fact: two descriptors
+inside one window of `CAP` can never share a slot. Theorems:
+
+- `mod_window_injective`: the general-mod engine — two in-window sums
+  with equal residues have equal summands.
+- `ring_mask_injective`: the masked form the Rust ring actually uses
+  (`x & (CAP - 1)`, `CAP = 2 ^ k`).
+-/
+
+theorem mod_window_injective (r j1 j2 n : Nat)
+    (hr : r < n) (h1 : j1 < n) (h2 : j2 < n)
+    (heq : (r + j1) % n = (r + j2) % n) : j1 = j2 := by
+  by_cases hb1 : r + j1 < n
+  · by_cases hb2 : r + j2 < n
+    · have e1 : (r + j1) % n = r + j1 := Nat.mod_eq_of_lt hb1
+      have e2 : (r + j2) % n = r + j2 := Nat.mod_eq_of_lt hb2
+      rw [e1, e2] at heq
+      omega
+    · have hle : n ≤ r + j2 := by omega
+      have e2 : (r + j2) % n = (r + j2 - n) % n := Nat.mod_eq_sub_mod hle
+      have e2' : (r + j2 - n) % n = r + j2 - n :=
+        Nat.mod_eq_of_lt (show r + j2 - n < n by omega)
+      rw [e2, e2', Nat.mod_eq_of_lt hb1] at heq
+      omega
+  · by_cases hb2 : r + j2 < n
+    · have hle : n ≤ r + j1 := by omega
+      have e1 : (r + j1) % n = (r + j1 - n) % n := Nat.mod_eq_sub_mod hle
+      have e1' : (r + j1 - n) % n = r + j1 - n :=
+        Nat.mod_eq_of_lt (show r + j1 - n < n by omega)
+      rw [e1, e1', Nat.mod_eq_of_lt hb2] at heq
+      omega
+    · have hle1 : n ≤ r + j1 := by omega
+      have hle2 : n ≤ r + j2 := by omega
+      have e1 : (r + j1) % n = (r + j1 - n) % n := Nat.mod_eq_sub_mod hle1
+      have e2 : (r + j2) % n = (r + j2 - n) % n := Nat.mod_eq_sub_mod hle2
+      have e1' : (r + j1 - n) % n = r + j1 - n :=
+        Nat.mod_eq_of_lt (show r + j1 - n < n by omega)
+      have e2' : (r + j2 - n) % n = r + j2 - n :=
+        Nat.mod_eq_of_lt (show r + j2 - n < n by omega)
+      rw [e1, e1', e2, e2'] at heq
+      omega
+
+/-- **Ring mask injectivity** (REQ-OS-001): the masked form the ring
+uses — `slot = (head + j) & (CAP - 1)` with `CAP = 2 ^ k`. Two
+descriptors in one window share a slot only when they are the same
+descriptor, so FIFO order is slot-consistent. -/
+theorem ring_mask_injective (head j1 j2 k : Nat)
+    (h1 : j1 < 2 ^ k) (h2 : j2 < 2 ^ k)
+    (heq : (head + j1) &&& (2 ^ k - 1) = (head + j2) &&& (2 ^ k - 1)) :
+    j1 = j2 := by
+  have expand1 : (head + j1) % 2 ^ k = (head % 2 ^ k + j1) % 2 ^ k := by
+    rw [Nat.add_mod, Nat.mod_eq_of_lt h1]
+  have expand2 : (head + j2) % 2 ^ k = (head % 2 ^ k + j2) % 2 ^ k := by
+    rw [Nat.add_mod, Nat.mod_eq_of_lt h2]
+  rw [Nat.and_two_pow_sub_one_eq_mod, Nat.and_two_pow_sub_one_eq_mod,
+    expand1, expand2] at heq
+  exact mod_window_injective (head % 2 ^ k) j1 j2 (2 ^ k)
+    (Nat.mod_lt _ (Nat.two_pow_pos k)) h1 h2 heq
+
 #print axioms ring_index_bounded
 #print axioms ring_mask_bounded
 #print axioms perm_pack_bounded
@@ -125,3 +187,5 @@ theorem heap_page_in_range (idx pages : Nat) (h : idx < pages) :
 #print axioms nvme_create_cq_qsize_extraction
 #print axioms heap_page_aligned
 #print axioms heap_page_in_range
+#print axioms mod_window_injective
+#print axioms ring_mask_injective

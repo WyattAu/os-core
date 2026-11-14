@@ -469,6 +469,7 @@ fn write_hex32(uart: &mut Serial<RawPorts>, v: u32) {
 // Vector layout: the PIC is remapped to 0x50-0x5F (away from the
 // 0x00-0x1F exception range), IRQ0 (PIT ch 0) lands on 0x50.
 
+#[allow(dead_code)] // the extern decls are consumed only via `as usize`
 extern "C" {
     fn timer_stub();
     fn spurious_stub();
@@ -482,8 +483,10 @@ extern "C" {
 static TIMER_TICKS: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
 
+/// The CPU reads this table; Rust only writes it through raw casts.
 #[repr(align(16))]
 #[derive(Clone, Copy)]
+#[allow(dead_code)]
 struct IdtTable([u64; 512]);
 
 static mut IDT: IdtTable = IdtTable([0; 512]);
@@ -530,7 +533,6 @@ extern "C" fn timer_tick() {
 /// it as a hard failure — loud, by design.
 #[no_mangle]
 extern "C" fn fault_tick(vector: usize) -> ! {
-    let mut ports = RawPorts;
     let mut uart = Serial::new(RawPorts, COM1);
     uart.write_str("\nFAULT vec=");
     write_hex32(&mut uart, vector as u32);
@@ -622,14 +624,16 @@ fn timer_smoke(min_ticks: usize, max_iterations: usize) -> usize {
 
 /// Brings up the IDT, remaps the PIC, programs the PIT, `sti`.
 fn timer_start() {
-    let mut dbg = Serial::new(RawPorts, COM1);
-
-    // IDT: vector 0x50 -> timer_stub; faults -> loud gates.
-    idt_set(0x50, timer_stub as usize);
-    idt_set(0x06, fault_stub_ud as usize);
-    idt_set(0x08, fault_stub_df as usize);
-    idt_set(0x0D, fault_stub_gp as usize);
-    idt_set(0x0E, fault_stub_pf as usize);
+    // IDT: vector 0x50 -> timer_stub; faults -> loud gates. The fn-item
+    // to-usize casts are the IDT idiom: the address IS the payload.
+    #[allow(clippy::fn_to_numeric_cast_any)]
+    {
+        idt_set(0x50, timer_stub as usize);
+        idt_set(0x06, fault_stub_ud as usize);
+        idt_set(0x08, fault_stub_df as usize);
+        idt_set(0x0D, fault_stub_gp as usize);
+        idt_set(0x0E, fault_stub_pf as usize);
+    }
     // SAFETY: IDT is a static owned by the boot thread before `sti`.
     unsafe {
         IDT_DESC.base = core::ptr::addr_of!(IDT) as usize as u64;
@@ -639,15 +643,12 @@ fn timer_start() {
             options(nostack)
         );
     }
-    dbg.write_str("[t-idt]");
 
     pic_pit_start();
-    dbg.write_str("[t-pit]");
 
     // SAFETY: IDT + PIC + PIT are fully programmed before interrupts
     // unmask.
     unsafe { core::arch::asm!("sti") };
-    dbg.write_str("[t-sti]");
 }
 
 /// THE unsafe boundary of the os-core program (ADR-0013): raw `in`/`out`.
@@ -799,9 +800,7 @@ extern "C" fn kernel_main() -> ! {
     // ---- LAPIC timer: the microcore's first real tick ----
     // (IDT + APIC + periodic timer; the handler only counts + EOI.)
     timer_start();
-    uart.write_str("[smoke-start]");
     let ticks = timer_smoke(200, 20_000_000);
-    uart.write_str("[smoke-done]");
     if ticks >= 10 {
         uart.write_str("TIMER PASS\n");
     } else {
