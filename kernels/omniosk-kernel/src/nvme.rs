@@ -16,16 +16,17 @@ const PCI_NVME_DEVICE: u16 = 0x0010;
 
 /// Page-aligned scratch: admin queues, identify data, I/O queues, read data.
 #[repr(C, align(4096))]
-pub struct Page {
-    pub b: [u8; 4096],
+/// The six DMA pages the smoke needs, supplied by the caller (the
+/// microcore heap — REQ-OS-007). All addresses must be 4 KiB-aligned
+/// and the pages zeroed before `smoke` runs.
+pub struct NvmePages {
+    pub asq: usize,
+    pub acq: usize,
+    pub ident: usize,
+    pub readb: usize,
+    pub iosq: usize,
+    pub iocq: usize,
 }
-
-static mut ADMIN_SQ: Page = Page { b: [0; 4096] };
-static mut ADMIN_CQ: Page = Page { b: [0; 4096] };
-static mut IDENT_BUF: Page = Page { b: [0; 4096] };
-static mut READ_BUF: Page = Page { b: [0; 4096] };
-static mut IO_SQ: Page = Page { b: [0; 4096] };
-static mut IO_CQ: Page = Page { b: [0; 4096] };
 
 const QSIZE: usize = 4;
 const MAGIC: &[u8] = b"OMNIOSK-NVME-OK!";
@@ -117,7 +118,7 @@ fn write_hex(uart: &mut Serial<RawPorts>, v: u32) {
 
 /// Full device bring-up + smoke. Serial carries per-stage progress and the
 /// controller's model number. Returns false on any failure.
-pub fn smoke() -> bool {
+pub fn smoke(p: &NvmePages) -> bool {
     let mut uart = Serial::new(RawPorts, COM1);
 
     // ---- PCI: find the QEMU NVMe on bus 0 ----
@@ -156,12 +157,9 @@ pub fn smoke() -> bool {
     }
 
     // SAFETY (package boundary, ADR-0013): DMA target buffers, statics.
-    let asq = core::ptr::addr_of!(ADMIN_SQ) as usize;
-    let acq = core::ptr::addr_of!(ADMIN_CQ) as usize;
-    let ident = core::ptr::addr_of!(IDENT_BUF) as usize;
-    let readb = core::ptr::addr_of!(READ_BUF) as usize;
-    let iosq = core::ptr::addr_of!(IO_SQ) as usize;
-    let iocq = core::ptr::addr_of!(IO_CQ) as usize;
+    let (asq, acq) = (p.asq, p.acq);
+    let (ident, readb) = (p.ident, p.readb);
+    let (iosq, iocq) = (p.iosq, p.iocq);
 
     mmio32w(bar, 0x24, ((QSIZE as u32 - 1) << 16) | (QSIZE as u32 - 1)); // AQA
     mmio64w(bar, 0x28, asq as u64); // ASQ

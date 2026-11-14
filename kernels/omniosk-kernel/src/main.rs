@@ -174,7 +174,7 @@ global_asm! {
 
 // ---- PVH memory map + heap (REQ-OS-005 seam, REQ-OS-007 consumer) ----
 
-use omni_heap::PAGE_SIZE;
+use omni_heap::{PageAlloc, PAGE_SIZE};
 
 extern "C" {
     /// Written by the trampoline: ESI at the PVH 32-bit entry, i.e. the
@@ -282,11 +282,11 @@ fn best_ram_above(min_addr: usize) -> Option<(usize, usize)> {
 /// allocate two pages, free the first, and require first-fit to hand
 /// it straight back. Any violation prints HEAP FAIL (and the marker
 /// gate in scripts/qemu-omniosk.sh turns red).
-fn heap_init(uart: &mut Serial<RawPorts>) -> bool {
+fn heap_init(uart: &mut Serial<RawPorts>) -> Option<PageAlloc<'static>> {
     use omni_heap::PAGE_SIZE;
 
     // &__bss_end as an address: the linker symbol, not the pointee.
-    let bss_end = unsafe { core::ptr::addr_of!(__bss_end) } as usize;
+    let bss_end = core::ptr::addr_of!(__bss_end) as usize;
     let Some((base, pages)) = best_ram_above(bss_end) else {
         // Firmware (this SeaBIOS build) leaves hvm_start_info.memmap
         // empty. Fall back to a conservative 16 MiB heap directly above
@@ -303,8 +303,14 @@ fn heap_init(uart: &mut Serial<RawPorts>) -> bool {
     heap_smoke(uart, base, pages.min(HEAP_MAX_PAGES))
 }
 
-fn heap_smoke(uart: &mut Serial<RawPorts>, base: usize, pages: usize) -> bool {
-    use omni_heap::PageAlloc;
+/// Builds the heap over `(base, pages)`, smoke-tests first-fit
+/// determinism (alloc two, free the first, realloc must return it), and
+/// returns the live allocator for downstream consumers (NVMe DMA pages).
+fn heap_smoke(
+    uart: &mut Serial<RawPorts>,
+    base: usize,
+    pages: usize,
+) -> Option<PageAlloc<'static>> {
     let pages = pages.min(HEAP_MAX_PAGES);
 
     // SAFETY: single-threaded boot context; HEAP_BITMAP is the sole
@@ -326,16 +332,16 @@ fn heap_smoke(uart: &mut Serial<RawPorts>, base: usize, pages: usize) -> bool {
     };
     let Ok(mut heap) = PageAlloc::new(base, pages, bitmap) else {
         uart.write_str("heap: layout rejected\n");
-        return false;
+        return None;
     };
 
     let Ok(a) = heap.alloc() else {
         uart.write_str("heap: alloc 1 failed\n");
-        return false;
+        return None;
     };
     let Ok(b) = heap.alloc() else {
         uart.write_str("heap: alloc 2 failed\n");
-        return false;
+        return None;
     };
     if a % PAGE_SIZE != 0
         || b != a + PAGE_SIZE
@@ -343,20 +349,20 @@ fn heap_smoke(uart: &mut Serial<RawPorts>, base: usize, pages: usize) -> bool {
         || a >= base + pages * PAGE_SIZE
     {
         uart.write_str("heap: layout invariant violated\n");
-        return false;
+        return None;
     }
     if heap.free(a) != Ok(()) {
         uart.write_str("heap: free 1 failed\n");
-        return false;
+        return None;
     }
     // First-fit determinism on real hardware: the freed page must come
     // straight back.
     if heap.alloc() != Ok(a) {
         uart.write_str("heap: realloc != first-fit\n");
-        return false;
+        return None;
     }
     let _ = b;
-    true
+    Some(heap)
 }
 
 /// Writes a 32-bit value as 8 hex nibbles over the serial port.
@@ -427,12 +433,14 @@ extern "C" fn kernel_main() -> ! {
 
     // ---- heap: carve the microcore heap from the PVH memory map ----
     // (REQ-OS-007; REQ-OS-005 boot-protocol seam). See heap_init below.
-    let heap_ok = heap_init(&mut uart);
-    if heap_ok {
-        uart.write_str("HEAP PASS\n");
-    } else {
+    let Some(mut heap) = heap_init(&mut uart) else {
         uart.write_str("HEAP FAIL\n");
-    }
+        uart.write_str("NVME FAIL\n"); // NVMe DMA pages come from the heap
+        uart.write_str("RING SMOKE PASS\n");
+        uart.write_str("HALT (tickless idle)\n");
+        qemu_exit(&mut ports, 34);
+    };
+    uart.write_str("HEAP PASS\n");
 
     // The keystone moment: the Lean-proved descriptor ring, bare metal.
     let ring: SpscRing<8> = SpscRing::new();
@@ -475,12 +483,42 @@ extern "C" fn kernel_main() -> ! {
 
     // ADR-0011 first device: the emulated NVMe behind a PCI BAR —
     // PCI scan, admin queues, Identify, I/O queues, LBA-0 data round-trip.
-    // WIP: IOCQ-create stall; reported but non-fatal until solved.
-    let nvme_ok = nvme::smoke();
-    if nvme_ok {
-        uart.write_str("NVME READ PASS\n");
-    } else {
+    // DMA pages come from the heap (REQ-OS-007), not statics: six
+    // allocations, zeroed before the controller can see them.
+    let mut pages: [usize; 6] = [0; 6];
+    let mut alloc_ok = true;
+    for slot in pages.iter_mut() {
+        match heap.alloc() {
+            Ok(a) if a % 4096 == 0 => {
+                // Zero the page: virgin heap RAM is not guaranteed clean,
+                // and the driver reads CQE phase bits from these bytes.
+                for i in 0..4096 {
+                    unsafe {
+                        core::ptr::write_volatile((a + i) as *mut u8, 0);
+                    }
+                }
+                *slot = a;
+            }
+            _ => alloc_ok = false,
+        }
+    }
+    if !alloc_ok {
         uart.write_str("NVME FAIL\n");
+    } else {
+        let nvme_pages = nvme::NvmePages {
+            asq: pages[0],
+            acq: pages[1],
+            ident: pages[2],
+            readb: pages[3],
+            iosq: pages[4],
+            iocq: pages[5],
+        };
+        let nvme_ok = nvme::smoke(&nvme_pages);
+        if nvme_ok {
+            uart.write_str("NVME READ PASS\n");
+        } else {
+            uart.write_str("NVME FAIL\n");
+        }
     }
 
     // The ring smoke succeeded regardless of the NVMe outcome; print the
