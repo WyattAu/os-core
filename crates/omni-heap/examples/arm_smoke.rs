@@ -5,6 +5,7 @@
 //! Prints `HEAP-ARM-PASS` on success; exits nonzero on any violation.
 
 use omni_heap::{HeapError, PageAlloc, PAGE_SIZE};
+use omni_ring::{slot::SlotTable, spsc::SpscRing};
 
 const BASE: usize = 0x4000_0000;
 const PAGES: usize = 64;
@@ -68,4 +69,19 @@ fn main() {
     assert_eq!(heap.used_pages(), PAGES, "heap is whole again");
 
     println!("HEAP-ARM-PASS ({PAGES} pages, {PAGE_SIZE} bytes/page)");
+
+    // Typed FIFO (REQ-OS-001 generic-payload follow-up): descriptors
+    // ride the ring, payloads live in the SlotTable — io_uring's model
+    // at micro scale, validated on the host target too.
+    let ring: SpscRing<8> = SpscRing::new();
+    let mut table: SlotTable<u64, 8> = SlotTable::new();
+    for d in 0u64..4 {
+        assert_eq!(table.write(d, d * 11), Some(()), "slot write");
+        assert_eq!(ring.try_push(d), None, "ring absorbs 4");
+    }
+    for d in 0u64..4 {
+        assert_eq!(ring.try_pop(), Some(d), "FIFO order");
+        assert_eq!(table.take(d), Some(d * 11), "typed round-trip");
+    }
+    println!("FIFO-ARM-PASS");
 }
