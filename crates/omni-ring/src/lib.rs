@@ -7,6 +7,10 @@
 //!   `u64` descriptors. Cache-line-padded cursors, pure atomics, no
 //!   `unsafe`. Index masking and bounded-step behavior are machine-checked
 //!   in `proofs/` (`ring_index_bounded`, goals.md §181).
+//! - [`slot::SlotTable`] — the generic-payload follow-up (REQ-OS-001),
+//!   resolved at the architecture layer: rings carry `u64` descriptors,
+//!   the table stores typed payloads. io_uring's model; keeps the
+//!   `unsafe_code = deny` contract intact.
 //! - [`mpmc::MpmcRing`] — **lock-free** bounded MPMC ring delegated to
 //!   `crossbeam_queue::ArrayQueue` (estate precedent: actor-kit, ferro).
 //!   Lock-free, not wait-free; that distinction is deliberate and honest.
@@ -29,4 +33,5 @@
 
 #[cfg(feature = "mpmc")]
 pub mod mpmc;
+pub mod slot;
 pub mod spsc;
