@@ -150,6 +150,7 @@ global_asm! {
            CS descriptor reload — executed in 32-bit compatibility mode,
            landing in the L=1 code64 descriptor */
         lgdt [gdtdesc]
+
         .att_syntax
         ljmp *farjump
         .intel_syntax noprefix
@@ -166,6 +167,86 @@ global_asm! {
         add rsp, 0x4000          /* top of the 16 KiB kernel stack */
         xor ebp, ebp
         call kernel_main
+    .section .text.int, "ax"
+    .global timer_stub
+    timer_stub:
+        push rax
+        push rcx
+        push rdx
+        push rbx
+        push rbp
+        push rsi
+        push rdi
+        push r8
+        push r9
+        push r10
+        push r11
+        push r12
+        push r13
+        push r14
+        push r15
+        call timer_tick
+        pop r15
+        pop r14
+        pop r13
+        pop r12
+        pop r11
+        pop r10
+        pop r9
+        pop r8
+        pop rdi
+        pop rsi
+        pop rbp
+        pop rbx
+        pop rdx
+        pop rcx
+        pop rax
+        iretq
+
+    /* Fault gates: loud failures. The faulting context is dead, so no
+       register preservation — the handler prints the vector and halts.
+       CPU-pushed error codes are popped into EDI (discarded) where the
+       vector has one; the vector number then rides in EDI (SysV arg 0). */
+    .section .text.int, "ax"
+    .code64
+    .global fault_stub_ud
+    fault_stub_ud:                 /* vector 6: no error code */
+        mov edi, 6
+        jmp fault_common
+    .global fault_stub_df
+    fault_stub_df:                 /* vector 8: DF pushes a zero code */
+        pop rdi
+        mov edi, 8
+        jmp fault_common
+    .global fault_stub_gp
+    fault_stub_gp:                 /* vector 13: error code */
+        pop rdi
+        mov edi, 13
+        jmp fault_common
+    .global fault_stub_pf
+    fault_stub_pf:                 /* vector 14: error code */
+        pop rdi
+        mov edi, 14
+        jmp fault_common
+    fault_common:
+        call fault_tick
+    1:
+        hlt
+        jmp 1b
+
+    /* Spurious interrupts: no EOI, no handler work — just return.
+       MUST NOT share the timer's vector: a spurious looped through the
+       timer handler starves the main loop (fetch_add grows forever). */
+    .global spurious_stub
+    spurious_stub:
+        lock inc DWORD PTR [rip + spurious_count]
+        iretq
+
+    .section .data.spurious, "aw"
+    .global spurious_count
+    spurious_count:
+        .long 0
+
     fail:
         hlt
         jmp fail
@@ -375,6 +456,200 @@ fn write_hex32(uart: &mut Serial<RawPorts>, v: u32) {
     }
 }
 
+// ---- PIT timer + remapped PIC (REQ-OS-008 seam: the microcore gets a
+// real tick; scheduling and sleeps build on this later) ----
+//
+// DISCOVERY (2026-11-14): the LAPIC timer is unusable as the first tick
+// source under TCG — QEMU derives the LAPIC clock from the emulated
+// TSC, so periods stretch to seconds and periodic re-arm-after-EOI
+// never lands inside a smoke window (1 tick per budget). The 8259 PIT
+// is emulated against QEMU_CLOCK_VIRTUAL at its real 1.193182 MHz rate:
+// deterministic, ms-scale ticks everywhere (TCG, KVM, hardware).
+//
+// Vector layout: the PIC is remapped to 0x50-0x5F (away from the
+// 0x00-0x1F exception range), IRQ0 (PIT ch 0) lands on 0x50.
+
+extern "C" {
+    fn timer_stub();
+    fn spurious_stub();
+    fn fault_stub_ud();
+    fn fault_stub_df();
+    fn fault_stub_gp();
+    fn fault_stub_pf();
+}
+
+/// Ticks delivered by the PIT since its last enable.
+static TIMER_TICKS: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+#[repr(align(16))]
+#[derive(Clone, Copy)]
+struct IdtTable([u64; 512]);
+
+static mut IDT: IdtTable = IdtTable([0; 512]);
+
+#[repr(C, packed)]
+struct LidtOperand {
+    limit: u16,
+    base: u64,
+}
+
+static mut IDT_DESC: LidtOperand = LidtOperand {
+    limit: 4095,
+    base: 0,
+};
+
+fn outb(port: u16, v: u8) {
+    // SAFETY: port I/O is the documented kernel boundary (ADR-0013).
+    unsafe { core::arch::asm!("out dx, al", in("dx") port, in("al") v) }
+}
+
+/// `rdmsr` — unused now that the tick source is the PIT; kept for the
+/// LAPIC calibration follow-up (REQ-OS-008).
+#[allow(dead_code)]
+fn rdmsr(msr: u32) -> u64 {
+    let (lo, hi): (u32, u32);
+    // SAFETY: privileged instruction in the kernel's unsafe boundary.
+    unsafe { core::arch::asm!("rdmsr", in("ecx") msr, out("eax") lo, out("edx") hi) };
+    ((hi as u64) << 32) | lo as u64
+}
+
+/// # Safety
+///
+/// Called only from `timer_stub` (the IDT gate for vector 0x50), with
+/// GP registers preserved by the stub and one PIT interrupt
+/// outstanding.
+#[no_mangle]
+extern "C" fn timer_tick() {
+    TIMER_TICKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    // PIC non-specific EOI (OCW2).
+    outb(0x20, 0x20);
+}
+
+/// Fault gate: prints the vector, halts forever. The smoke timeout reads
+/// it as a hard failure — loud, by design.
+#[no_mangle]
+extern "C" fn fault_tick(vector: usize) -> ! {
+    let mut ports = RawPorts;
+    let mut uart = Serial::new(RawPorts, COM1);
+    uart.write_str("\nFAULT vec=");
+    write_hex32(&mut uart, vector as u32);
+    uart.write_str("\n");
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+/// Installs the IDT gate for `vector` -> `handler`.
+fn idt_set(vector: u8, handler: usize) {
+    let handler = handler as u64;
+    // Type 0xF = 64-bit interrupt gate (0xE is the 32-bit one — using
+    // it in long mode #GPs on gate delivery, error code = IDT|index).
+    //
+    // The 64-bit offset is split THREE ways: bits 0-15 at entry bits
+    // 0-15, bits 16-31 at entry bits 48-63, bits 32-63 in the high
+    // word. Dropping the middle field truncates the handler to its low
+    // 16 bits — timer_stub at 0x1002b7 delivered as 0x2b7, landing in
+    // SeaBIOS's low-memory code.
+    let low = (handler & 0xFFFF)
+        | (0x08u64 << 16)          // CS selector
+        | (0x8Fu64 << 40)          // present | interrupt gate 64-bit, DPL 0
+        | (((handler >> 16) & 0xFFFF) << 48); // offset bits 16-31
+    let high = handler >> 32;
+    let slot = vector as usize * 2;
+    // SAFETY: IDT is a static owned by the boot thread before `sti`.
+    unsafe {
+        let table = core::ptr::addr_of_mut!(IDT).cast::<u64>();
+        core::ptr::write_volatile(table.add(slot), low);
+        core::ptr::write_volatile(table.add(slot + 1), high);
+    }
+}
+
+/// Remaps the 8259 PIC to vectors 0x50-0x5F, unmasks IRQ0 only, and
+/// programs PIT channel 0 as a ~1 kHz rate generator.
+fn pic_pit_start() {
+    // PIC remap, ICW1-4: cascade, vector base 0x50 / 0x58, 8086 mode.
+    outb(0x20, 0x11); // master ICW1: init + ICW4
+    outb(0xA0, 0x11); // slave ICW1
+    outb(0x21, 0x50); // master ICW2: IRQ0-7 -> 0x50-0x57
+    outb(0xA1, 0x58); // slave ICW2: IRQ8-15 -> 0x58-0x5F
+    outb(0x21, 0x04); // master ICW3: slave on IRQ2
+    outb(0xA1, 0x02); // slave ICW3: cascade identity
+    outb(0x21, 0x01); // ICW4: 8086 mode
+    outb(0xA1, 0x01);
+    // Mask everything except IRQ0 (the PIT).
+    outb(0x21, 0xFE);
+    outb(0xA1, 0xFF);
+
+    // PIT channel 0: mode 2 (rate generator), low/high byte, divisor
+    // 1193 -> 1193182 Hz / 1193 = ~1000 Hz.
+    outb(0x43, 0x36);
+    let divisor = 1193u32;
+    outb(0x40, (divisor & 0xFF) as u8);
+    outb(0x40, ((divisor >> 8) & 0xFF) as u8);
+}
+
+/// LAPIC-timer smoke: interrupts on, spin until the tick counter has
+/// advanced `min_ticks` (or the iteration budget is spent). Returns
+/// the tick count — PASS requires >= min_ticks.
+fn timer_smoke(min_ticks: usize, max_iterations: usize) -> usize {
+    use core::sync::atomic::Ordering;
+    let mut dbg = Serial::new(RawPorts, COM1);
+    let mut iters = 0usize;
+    while iters < max_iterations {
+        let now = TIMER_TICKS.load(Ordering::Relaxed);
+        if now >= min_ticks {
+            dbg.write_str("[smoke-done tk=");
+            write_hex32(&mut dbg, now as u32);
+            dbg.write_str("]");
+            return now;
+        }
+        if iters % 5_000_000 == 0 && iters > 0 {
+            dbg.write_str("[it=");
+            write_hex32(&mut dbg, iters as u32);
+            dbg.write_str(" tk=");
+            write_hex32(&mut dbg, now as u32);
+            dbg.write_str("]");
+        }
+        iters += 1;
+    }
+    let now = TIMER_TICKS.load(Ordering::Relaxed);
+    dbg.write_str("[budget tk=");
+    write_hex32(&mut dbg, now as u32);
+    dbg.write_str("]");
+    now
+}
+
+/// Brings up the IDT, remaps the PIC, programs the PIT, `sti`.
+fn timer_start() {
+    let mut dbg = Serial::new(RawPorts, COM1);
+
+    // IDT: vector 0x50 -> timer_stub; faults -> loud gates.
+    idt_set(0x50, timer_stub as usize);
+    idt_set(0x06, fault_stub_ud as usize);
+    idt_set(0x08, fault_stub_df as usize);
+    idt_set(0x0D, fault_stub_gp as usize);
+    idt_set(0x0E, fault_stub_pf as usize);
+    // SAFETY: IDT is a static owned by the boot thread before `sti`.
+    unsafe {
+        IDT_DESC.base = core::ptr::addr_of!(IDT) as usize as u64;
+        core::arch::asm!(
+            "lidt [{}]",
+            in(reg) core::ptr::addr_of!(IDT_DESC),
+            options(nostack)
+        );
+    }
+    dbg.write_str("[t-idt]");
+
+    pic_pit_start();
+    dbg.write_str("[t-pit]");
+
+    // SAFETY: IDT + PIC + PIT are fully programmed before interrupts
+    // unmask.
+    unsafe { core::arch::asm!("sti") };
+    dbg.write_str("[t-sti]");
+}
+
 /// THE unsafe boundary of the os-core program (ADR-0013): raw `in`/`out`.
 struct RawPorts;
 
@@ -519,6 +794,18 @@ extern "C" fn kernel_main() -> ! {
         } else {
             uart.write_str("NVME FAIL\n");
         }
+    }
+
+    // ---- LAPIC timer: the microcore's first real tick ----
+    // (IDT + APIC + periodic timer; the handler only counts + EOI.)
+    timer_start();
+    uart.write_str("[smoke-start]");
+    let ticks = timer_smoke(200, 20_000_000);
+    uart.write_str("[smoke-done]");
+    if ticks >= 10 {
+        uart.write_str("TIMER PASS\n");
+    } else {
+        uart.write_str("TIMER FAIL\n");
     }
 
     // The ring smoke succeeded regardless of the NVMe outcome; print the
