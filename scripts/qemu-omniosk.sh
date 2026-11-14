@@ -57,7 +57,7 @@ done
 # NVMe markers are REQUIRED: the driver completes the full path (PCI
 # scan -> controller init -> Identify -> Create IOCQ/IOSQ -> DMA read).
 nvme_missing=0
-for marker in "HEAP PASS" "TIMER PASS" "NVME IDENT PASS" "NVME READ PASS" "NVME WRITE PASS"; do
+for marker in "HEAP PASS" "TIMER PASS" "SLEEP PASS" "NVME IDENT PASS" "NVME READ PASS" "NVME WRITE PASS"; do
     grep -q "$marker" "$log" || {
         echo "qemu-omniosk: WARN (serial missing '$marker' — NVMe WIP)" >&2
         nvme_missing=1

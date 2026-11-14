@@ -594,6 +594,31 @@ fn pic_pit_start() {
 /// LAPIC-timer smoke: interrupts on, spin until the tick counter has
 /// advanced `min_ticks` (or the iteration budget is spent). Returns
 /// the tick count — PASS requires >= min_ticks.
+/// Halts until `ms` milliseconds of PIT ticks have elapsed. With
+/// interrupts enabled, `hlt` sleeps the core and wakes on each tick
+/// (~1 kHz) — the CPU rests between ticks instead of burning the
+/// window. Returns the ticks actually elapsed (the caller compares
+/// against `ms` to validate the ~1 kHz calibration).
+fn kernel_sleep_ticks(uart: &mut Serial<RawPorts>, target: usize) -> usize {
+    use core::sync::atomic::Ordering;
+    let start = TIMER_TICKS.load(Ordering::Relaxed);
+    let goal = start.saturating_add(target);
+    let mut last = start;
+    while TIMER_TICKS.load(Ordering::Relaxed) < goal {
+        // SAFETY: interrupts are enabled; the PIT wakes the core.
+        unsafe { core::arch::asm!("hlt") };
+        let now = TIMER_TICKS.load(Ordering::Relaxed);
+        if now == last {
+            // No tick in a whole halt cycle: the tick source died
+            // (masked/unprogrammed) — the sleep would never end.
+            uart.write_str("sleep: no tick progress\n");
+            return now.saturating_sub(start);
+        }
+        last = now;
+    }
+    TIMER_TICKS.load(Ordering::Relaxed).saturating_sub(start)
+}
+
 fn timer_smoke(min_ticks: usize, max_iterations: usize) -> usize {
     use core::sync::atomic::Ordering;
     let mut dbg = Serial::new(RawPorts, COM1);
@@ -713,7 +738,7 @@ extern "C" fn kernel_main() -> ! {
         uart.write_str("HEAP FAIL\n");
         uart.write_str("NVME FAIL\n"); // NVMe DMA pages come from the heap
         uart.write_str("RING SMOKE PASS\n");
-        uart.write_str("HALT (tickless idle)\n");
+        uart.write_str("HALT (idle, 1 kHz tick)\n");
         qemu_exit(&mut ports, 34);
     };
     uart.write_str("HEAP PASS\n");
@@ -807,9 +832,20 @@ extern "C" fn kernel_main() -> ! {
         uart.write_str("TIMER FAIL\n");
     }
 
+    // ---- sleep: interrupt-driven halt for ~250 ms of ticks ----
+    // PASS requires the elapsed ticks to track the request within
+    // [40%, 250%] — validating the ~1 kHz calibration empirically
+    // (a dead tick source fails via the no-progress guard above).
+    let slept = kernel_sleep_ticks(&mut uart, 250);
+    if slept >= 100 && slept <= 625 {
+        uart.write_str("SLEEP PASS\n");
+    } else {
+        uart.write_str("SLEEP FAIL\n");
+    }
+
     // The ring smoke succeeded regardless of the NVMe outcome; print the
     // success marker unconditionally so the QEMU smoke gate is clean.
     uart.write_str("RING SMOKE PASS\n");
-    uart.write_str("HALT (tickless idle)\n");
+    uart.write_str("HALT (idle, 1 kHz tick)\n");
     qemu_exit(&mut ports, 31)
 }
