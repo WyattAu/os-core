@@ -697,6 +697,7 @@ dependencies = [
 name = "omni-heap"
 version = "0.1.0"
 dependencies = [
+ "omni-ring",
  "proptest",
 ]
 
