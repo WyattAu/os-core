@@ -35,6 +35,7 @@ first shippable artifacts only.
 | REQ-OS-005 | `omniosk` seed (K4): boot-capable `no_std` library modules (serial `PortIo` seam, qemu-exit, bare-metal ring integration) host-tested under tier-a gates; kernel bin + QEMU harness per ADR-0013 | SHOULD |
 | REQ-OS-006 | NVMe block-write path in `omniosk`: WRITE one block to LBA 1 over the I/O queues, read it back, byte-compare in-kernel; the full block path (read + write + verify) asserted in the QEMU smoke gate | SHOULD |
 | REQ-OS-007 | `omni-heap`: deterministic bitmap page allocator for the microcore — borrowed bitmap (kernel `static` or stack array), `no_std`, panic-free (every failure is a `Result`), first-fit deterministic layout | SHOULD |
+| REQ-OS-008 | Microcore tick + sleep: PIT-backed ~1 kHz tick (PIC remapped to 0x50+, IRQ0 only), IDT with 64-bit gates + fault gates, interrupt-driven `hlt` sleep with a no-progress guard; `omni-task` cooperative round-robin task slots consume the tick | SHOULD |
 
 ## Traceability Matrix
 
@@ -49,3 +50,4 @@ first shippable artifacts only.
 | REQ-OS-005 | omniosk unit tests over mock port sink; boot path per ADR-0013 | unit + design |
 | REQ-OS-006 | `NVME WRITE PASS` serial marker, asserted required in `scripts/qemu-omniosk.sh` (write -> read-back -> byte-compare in-kernel) | empirical |
 | REQ-OS-007 | proptest model equivalence (`crates/omni-heap/tests/model.rs`) + `heap_page_aligned` / `heap_page_in_range` Lean theorems | model-checked |
+| REQ-OS-008 | `TIMER PASS` + `SLEEP PASS` serial markers asserted required in `scripts/qemu-omniosk.sh` (tick presence + 250 ms calibration within tolerance); `crates/omni-task` fairness proptests (exact rotation, no starvation under churn) | empirical + model |

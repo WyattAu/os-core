@@ -178,6 +178,21 @@ theorem ring_mask_injective (head j1 j2 k : Nat)
   exact mod_window_injective (head % 2 ^ k) j1 j2 (2 ^ k)
     (Nat.mod_lt _ (Nat.two_pow_pos k)) h1 h2 heq
 
+/-- **In-flight non-aliasing** (REQ-OS-001, Phase-3): two DISTINCT
+in-flight descriptors (both inside the tail window of an in-flight
+count no larger than CAP) cannot occupy the same slot — aliasing a
+slot mid-flight would corrupt the descriptor being transported. Direct
+contrapositive of the window injectivity engine. -/
+theorem ring_inflight_distinct (tail j1 j2 k inflight : Nat)
+    (h1 : j1 < inflight) (h2 : j2 < inflight) (hne : j1 ≠ j2)
+    (hwindow : inflight ≤ 2 ^ k)
+    (heq : (tail + j1) &&& (2 ^ k - 1) = (tail + j2) &&& (2 ^ k - 1)) :
+    False := by
+  have hj1 : j1 < 2 ^ k := Nat.lt_of_lt_of_le h1 hwindow
+  have hj2 : j2 < 2 ^ k := Nat.lt_of_lt_of_le h2 hwindow
+  exact hne (ring_mask_injective tail j1 j2 k hj1 hj2 heq)
+
+#print axioms ring_inflight_distinct
 #print axioms ring_index_bounded
 #print axioms ring_mask_bounded
 #print axioms perm_pack_bounded
