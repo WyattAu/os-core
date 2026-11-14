@@ -13,4 +13,4 @@ workspace = true
 
 [dev-dependencies]
 proptest = { workspace = true }
-omni-ring = { path = "../omni-ring" }
+omni-ring = { path = "../omni-ring", version = "0.1" }
