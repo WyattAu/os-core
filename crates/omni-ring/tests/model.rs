@@ -33,15 +33,15 @@ proptest! {
 /// Typed FIFO end-to-end (REQ-OS-001 generic-payload follow-up): values
 /// written into a `SlotTable` at descriptor `d`, transported by the ring,
 /// and read back after popping — come out in push order with the exact
-/// typed payload. This is io_uring's model at micro scale.
+/// typed payload. This is `io_uring`'s model at micro scale.
 #[test]
 fn spsc_slot_table_typed_fifo() {
     use omni_ring::{slot::SlotTable, spsc::SpscRing};
 
     #[derive(Debug, Clone, Copy, PartialEq)]
     struct Task {
-        id: u16,
-        flags: u8,
+        id: u64,
+        flags: u64,
     }
 
     let ring: SpscRing<8> = SpscRing::new();
@@ -49,8 +49,8 @@ fn spsc_slot_table_typed_fifo() {
 
     for d in 0u64..4 {
         let task = Task {
-            id: (d as u16) * 7,
-            flags: 0xA0 | d as u8,
+            id: d * 7,
+            flags: 0xA0 | d,
         };
         assert_eq!(table.write(d, task), Some(()));
         assert_eq!(ring.try_push(d), None, "ring absorbs 4 descriptors");
@@ -63,8 +63,8 @@ fn spsc_slot_table_typed_fifo() {
         assert_eq!(
             task,
             Some(Task {
-                id: (d as u16) * 7,
-                flags: 0xA0 | d as u8,
+                id: d * 7,
+                flags: 0xA0 | d,
             }),
             "typed payload round-trips"
         );
