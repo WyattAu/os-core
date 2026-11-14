@@ -4,7 +4,7 @@
 //! architecture layer, not the atomics layer: rings carry `u64`
 //! descriptors (the Lean-provable surface — `ring_index_bounded`), and
 //! a [`SlotTable`] gives those descriptors typed storage. This is
-//! io_uring's model — the queue moves indices, the data lives in slots
+//! `io_uring`'s model — the queue moves indices, the data lives in slots
 //! — and it keeps the estate's `unsafe_code = deny` contract intact:
 //! the hand-rolled ring stays zero-unsafe, and the table adds nothing
 //! that could break that.
@@ -39,7 +39,13 @@ impl<T: Copy, const N: usize> SlotTable<T, N> {
 
     /// Writes `value` at descriptor `d`; `None` when `d >= N`.
     pub fn write(&mut self, d: u64, value: T) -> Option<()> {
-        let slot = self.slots.get_mut(d as usize)?;
+        // Guard the conversion first: `d >= N` can never truncate.
+        // Lossless widening conversion; `i >= N` covers the bound.
+        let i = usize::try_from(d).ok()?;
+        if i >= N {
+            return None;
+        }
+        let slot = self.slots.get_mut(i)?;
         *slot = Some(value);
         Some(())
     }
@@ -48,7 +54,11 @@ impl<T: Copy, const N: usize> SlotTable<T, N> {
     /// `None` when `d >= N` or the slot was never written (or was
     /// already taken).
     pub fn take(&mut self, d: u64) -> Option<T> {
-        let slot = self.slots.get_mut(d as usize)?;
+        let i = usize::try_from(d).ok()?;
+        if i >= N {
+            return None;
+        }
+        let slot = self.slots.get_mut(i)?;
         slot.take()
     }
 }
