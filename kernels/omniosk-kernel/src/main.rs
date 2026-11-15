@@ -456,8 +456,8 @@ fn write_hex32(uart: &mut Serial<RawPorts>, v: u32) {
     }
 }
 
-// ---- PIT timer + remapped PIC (REQ-OS-008 seam: the microcore gets a
-// real tick; scheduling and sleeps build on this later) ----
+// ---- PIT timer + remapped PIC + omni-task dispatch (REQ-OS-008:
+// the microcore gets a real tick and round-robin task slots on it) ----
 //
 // DISCOVERY (2026-11-14): the LAPIC timer is unusable as the first tick
 // source under TCG — QEMU derives the LAPIC clock from the emulated
@@ -470,6 +470,8 @@ fn write_hex32(uart: &mut Serial<RawPorts>, v: u32) {
 // 0x00-0x1F exception range), IRQ0 (PIT ch 0) lands on 0x50.
 
 #[allow(dead_code)] // the extern decls are consumed only via `as usize`
+use omni_task::Scheduler;
+
 extern "C" {
     fn timer_stub();
     fn spurious_stub();
@@ -525,6 +527,7 @@ fn rdmsr(msr: u32) -> u64 {
 #[no_mangle]
 extern "C" fn timer_tick() {
     TIMER_TICKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    sched_isr_tick();
     // PIC non-specific EOI (OCW2).
     outb(0x20, 0x20);
 }
@@ -645,6 +648,42 @@ fn timer_smoke(min_ticks: usize, max_iterations: usize) -> usize {
     write_hex32(&mut dbg, now as u32);
     dbg.write_str("]");
     now
+}
+
+/// Task slots dispatched by the PIT ISR (round-robin, omni-task).
+/// `None` until kernel_main builds the scheduler; the ISR skips
+/// dispatch while it is absent (pre-registration ticks are safe).
+static mut SCHED: Option<Scheduler<4>> = None;
+
+/// Dispatch bookkeeping for the smoke: a never-done task proves the
+/// rotation, a retire-after-3 task proves slot retirement.
+static TASK_RUNS: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+static RETIRE_RUNS: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+/// Demo task A: never retires (the rotation witness).
+fn task_blink() -> bool {
+    TASK_RUNS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    false
+}
+
+/// Demo task B: retires after 3 dispatches (the retirement witness).
+fn task_retire() -> bool {
+    let n = RETIRE_RUNS.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+    n >= 3
+}
+
+/// The PIT ISR's dispatch step. SAFETY: called only from the timer ISR
+/// (IF is cleared inside the handler, so no reentrancy); `SCHED` is
+/// initialized once by kernel_main before `sti` and never moved.
+fn sched_isr_tick() {
+    // SAFETY: see fn docs.
+    let sched = unsafe { core::ptr::addr_of_mut!(SCHED) };
+    // SAFETY: see fn docs.
+    if let Some(s) = unsafe { (*sched).as_mut() } {
+        s.tick();
+    }
 }
 
 /// Brings up the IDT, remaps the PIC, programs the PIT, `sti`.
@@ -830,6 +869,72 @@ extern "C" fn kernel_main() -> ! {
         uart.write_str("TIMER PASS\n");
     } else {
         uart.write_str("TIMER FAIL\n");
+    }
+
+    // ---- tasks: omni-task slots dispatched by the PIT ISR ----
+    // (REQ-OS-008 consumer.) Registered here, before the window: the
+    // rotation witness must run, the retire task must retire.
+    // SAFETY: single-threaded boot context; SCHED is the sole owner of
+    // the scheduler (same static-mut pattern as HEAP_BITMAP).
+    //
+    // INITIALIZATION GOES THROUGH THE OPTION DIRECTLY: an as_mut-based
+    // init would be gated on SCHED already being Some — the exact bug
+    // this block shipped with (as_mut on None silently skipped the
+    // whole setup; the ISR skipped dispatch; TASK FAIL all zeros).
+    let sched = unsafe { core::ptr::addr_of_mut!(SCHED) };
+    let mut fresh = Scheduler::new();
+    let _ = fresh.spawn("blink", task_blink);
+    let _ = fresh.spawn("retire", task_retire);
+    // SAFETY: see above.
+    unsafe { *sched = Some(fresh) };
+
+    let mut iters = 0usize;
+    let mut rotation_ok = false;
+    let mut retire_ok = false;
+    while iters < 20_000_000 {
+        let runs = TASK_RUNS.load(core::sync::atomic::Ordering::Relaxed);
+        let retire = RETIRE_RUNS.load(core::sync::atomic::Ordering::Relaxed);
+        if runs >= 5 {
+            rotation_ok = true;
+            if retire >= 3 {
+                retire_ok = true;
+                break;
+            }
+        }
+        iters += 1;
+    }
+    // SAFETY: see above; the scheduler is still initialized.
+    let live_ok = unsafe { (*sched).as_mut() }
+        .is_some_and(|s| s.live() == 1);
+    if rotation_ok && retire_ok && live_ok {
+        uart.write_str("TASK PASS\n");
+    } else {
+        uart.write_str("TASK FAIL (rot=");
+        uart.write_byte(b'0' + rotation_ok as u8);
+        uart.write_str(" ret=");
+        uart.write_byte(b'0' + retire_ok as u8);
+        uart.write_str(" live=");
+        uart.write_byte(b'0' + live_ok as u8);
+        uart.write_str(" runs=");
+        write_hex32(&mut uart,
+            TASK_RUNS.load(core::sync::atomic::Ordering::Relaxed) as u32);
+        uart.write_str(" ret_runs=");
+        write_hex32(&mut uart,
+            RETIRE_RUNS.load(core::sync::atomic::Ordering::Relaxed) as u32);
+        // Scheduler state: initialized? live? dispatches?
+        let sched = unsafe { core::ptr::addr_of_mut!(SCHED) };
+        // SAFETY: single-threaded diagnostics context.
+        let (is_some, live, dispatches) = unsafe { (*sched).as_mut() }
+            .map_or((0u8, 0usize, 0u64), |s| {
+                (1u8, s.live(), s.dispatches())
+            });
+        uart.write_str(" sch=");
+        uart.write_byte(b'0' + is_some);
+        uart.write_str(" live=");
+        write_hex32(&mut uart, live as u32);
+        uart.write_str(" disp=");
+        write_hex32(&mut uart, dispatches as u32);
+        uart.write_str(")\n");
     }
 
     // ---- sleep: interrupt-driven halt for ~250 ms of ticks ----

@@ -11,6 +11,10 @@ name = "omni-ring"
 version = "0.1.0"
 
 [[package]]
+name = "omni-task"
+version = "0.1.0"
+
+[[package]]
 name = "omniosk"
 version = "0.1.0"
 
@@ -20,5 +24,6 @@ version = "0.1.0"
 dependencies = [
  "omni-heap",
  "omni-ring",
+ "omni-task",
  "omniosk",
 ]
