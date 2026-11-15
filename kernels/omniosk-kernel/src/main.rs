@@ -470,7 +470,7 @@ fn write_hex32(uart: &mut Serial<RawPorts>, v: u32) {
 // 0x00-0x1F exception range), IRQ0 (PIT ch 0) lands on 0x50.
 
 #[allow(dead_code)] // the extern decls are consumed only via `as usize`
-use omni_task::Scheduler;
+use omni_task::{Scheduler, TaskCtx, TaskFlow};
 
 extern "C" {
     fn timer_stub();
@@ -663,15 +663,19 @@ static RETIRE_RUNS: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
 
 /// Demo task A: never retires (the rotation witness).
-fn task_blink() -> bool {
+fn task_blink(_ctx: &mut TaskCtx) -> TaskFlow {
     TASK_RUNS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    false
+    TaskFlow::Continue
 }
 
 /// Demo task B: retires after 3 dispatches (the retirement witness).
-fn task_retire() -> bool {
+fn task_retire(_ctx: &mut TaskCtx) -> TaskFlow {
     let n = RETIRE_RUNS.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
-    n >= 3
+    if n >= 3 {
+        TaskFlow::Done
+    } else {
+        TaskFlow::Continue
+    }
 }
 
 /// The PIT ISR's dispatch step. SAFETY: called only from the timer ISR
