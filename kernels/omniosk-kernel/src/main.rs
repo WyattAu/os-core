@@ -856,10 +856,14 @@ extern "C" fn kernel_main() -> ! {
         let mut nvme_session = nvme::smoke(&nvme_pages);
         let mut nvme_ok = nvme_session.is_some();
         if let Some(mut session) = nvme_session {
-            // The retained session is the omni-block seam surface:
-            // re-read LBA 0 through read_lba and re-verify the magic.
+            // The retained session implements omni_block::BlockDevice —
+            // the seam surface: re-read LBA 0 through the trait and
+            // re-verify the magic.
+            use omni_block::BlockDevice;
             let mut lba0 = [0u8; 512];
-            nvme_ok = nvme::read_lba(&mut session, 0, &mut lba0)
+            nvme_ok = session
+                .read_lba(0, &mut lba0)
+                .is_ok()
                 && lba0[..nvme::MAGIC.len()] == *nvme::MAGIC;
         }
         if nvme_ok {

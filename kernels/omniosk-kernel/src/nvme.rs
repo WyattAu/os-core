@@ -187,30 +187,41 @@ fn io_write_lba(s: &mut NvmeSession, lba: u64) -> bool {
     ok
 }
 
-/// Reads one LBA into `out` over the session's I/O queues.
-///
-/// Reserved for the `omni-block` seam: the `BlockDevice` trait lands
-/// when a second implementation exists (see crates/omni-block docs);
-/// until then this is the kernel-side callable surface.
-#[allow(dead_code)]
-pub fn read_lba(s: &mut NvmeSession, lba: u64, out: &mut [u8; 512]) -> bool {
-    if !io_read_lba(s, lba) {
-        return false;
-    }
-    for (i, slot) in out.iter_mut().enumerate() {
-        *slot = vbyte(s.readb, i);
-    }
-    true
-}
+use omni_block::{BlockDevice, BlockError};
 
-/// Writes `data` (staged into the session's read page) to one LBA over
-/// the session's I/O queues.
-#[allow(dead_code)]
-pub fn write_lba(s: &mut NvmeSession, lba: u64, data: &[u8; 512]) -> bool {
-    for (i, b) in data.iter().enumerate() {
-        wbyte(s.readb, i, *b);
+/// The `omni-block` contract over the NVMe I/O queues (REQ layer).
+/// Capacity is the VERIFIED extent (the smoke exercised LBAs 0 and 1);
+/// parsing the namespace size from Identify-Namespace is a follow-up.
+impl BlockDevice for NvmeSession {
+    fn capacity_lbas(&self) -> u64 {
+        2
     }
-    io_write_lba(s, lba)
+
+    fn read_lba(&mut self, lba: u64, out: &mut [u8; 512]) -> Result<(), BlockError> {
+        if lba >= self.capacity_lbas() {
+            return Err(BlockError::OutOfRange);
+        }
+        if !io_read_lba(self, lba) {
+            return Err(BlockError::Io);
+        }
+        for (i, slot) in out.iter_mut().enumerate() {
+            *slot = vbyte(self.readb, i);
+        }
+        Ok(())
+    }
+
+    fn write_lba(&mut self, lba: u64, data: &[u8; 512]) -> Result<(), BlockError> {
+        if lba >= self.capacity_lbas() {
+            return Err(BlockError::OutOfRange);
+        }
+        for (i, b) in data.iter().enumerate() {
+            wbyte(self.readb, i, *b);
+        }
+        if !io_write_lba(self, lba) {
+            return Err(BlockError::Io);
+        }
+        Ok(())
+    }
 }
 
 /// Full device bring-up + smoke. Serial carries per-stage progress and the

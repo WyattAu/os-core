@@ -3,6 +3,10 @@
 version = 4
 
 [[package]]
+name = "omni-block"
+version = "0.1.0"
+
+[[package]]
 name = "omni-heap"
 version = "0.1.0"
 
@@ -22,6 +26,7 @@ version = "0.1.0"
 name = "omniosk-kernel"
 version = "0.1.0"
 dependencies = [
+ "omni-block",
  "omni-heap",
  "omni-ring",
  "omni-task",

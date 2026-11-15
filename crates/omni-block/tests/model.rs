@@ -3,7 +3,7 @@
 //! contract, range rejection, sector independence, and a multi-sector
 //! sweep. Same model-based pattern as omni-heap and omni-ring.
 
-use omni_block::{BlockError, BlockRam, LBA_SIZE};
+use omni_block::{BlockDevice, BlockError, BlockRam, LBA_SIZE};
 use proptest::prelude::*;
 
 const SECTORS: usize = 8;

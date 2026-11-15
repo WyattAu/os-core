@@ -7,14 +7,15 @@
 //! and the smoke semantics are defined once, against a device model,
 //! not re-derived per driver.
 //!
-//! **The seam is concrete types, deliberately.** No trait objects, no
-//! `alloc`: a trait would let drivers share a vtable before a second
-//! implementation exists, and the first non-`BlockRam` candidate (the
-//! `NVMe` queue pair) has DMA constraints a `&mut dyn` surface cannot
-//! express. The trait arrives with the `NVMe` impl, generalized *from*
-//! two working implementations — not guessed ahead of one. Until then,
-//! [`BlockRam`] is the reference device: an in-memory, zero-initialized
-//! array of [`LBA_SIZE`] sectors that never allocates and never panics.
+//! **The seam generalized from two implementations.** [`BlockRam`] is
+//! the in-memory reference device; the `NVMe` queue pair in
+//! `omniosk-kernel` implements the same [`BlockDevice`] contract over
+//! its I/O queues (its `read_lba`/`write_lba` are the exact calls the
+//! smoke exercised before the trait existed). The trait is the
+//! contract, not a vtable mandate: consumers can stay generic over
+//! `B: BlockDevice` (static dispatch, no `alloc`) — `&mut dyn` remains
+//! available where DMA constraints permit. [`BlockRam`] never
+//! allocates and never panics.
 //!
 //! Invariants (asserted by `tests/model.rs`):
 //!
@@ -110,6 +111,42 @@ impl<const SECTORS: usize> BlockRam<SECTORS> {
         Ok(())
     }
 
+    /// Sector index for `lba`, bounds-checked without indexing.
+    fn sector_index(lba: u64) -> Result<usize, BlockError> {
+        let i = usize::try_from(lba).map_err(|_| BlockError::OutOfRange)?;
+        if i >= SECTORS {
+            return Err(BlockError::OutOfRange);
+        }
+        Ok(i)
+    }
+}
+
+/// The block-device contract (REQ layer): LBA-addressed sector
+/// transport of exactly [`LBA_SIZE`] bytes per operation.
+///
+/// Implementations: [`BlockRam`] (the in-memory reference) and the
+/// `NVMe` session in `omniosk-kernel` (the bare-metal path the QEMU
+/// smoke gates). Consumers stay generic over `B: BlockDevice`.
+pub trait BlockDevice {
+    /// The device capacity in logical blocks.
+    fn capacity_lbas(&self) -> u64;
+
+    /// Reads sector `lba` into `out`.
+    ///
+    /// # Errors
+    ///
+    /// Implementation-defined mapping of [`BlockError`]; `OutOfRange`
+    /// for an LBA beyond the capacity.
+    fn read_lba(&mut self, lba: u64, out: &mut [u8; LBA_SIZE]) -> Result<(), BlockError>;
+
+    /// Writes `data` to sector `lba`.
+    ///
+    /// # Errors
+    ///
+    /// Implementation-defined mapping of [`BlockError`]; `OutOfRange`
+    /// for an LBA beyond the capacity.
+    fn write_lba(&mut self, lba: u64, data: &[u8; LBA_SIZE]) -> Result<(), BlockError>;
+
     /// The kernel's WRITE/read-back smoke (REQ-OS-006, the
     /// `NVME WRITE PASS` semantics) as a library call: write `data` to
     /// `lba`, read the sector back, byte-compare.
@@ -122,7 +159,7 @@ impl<const SECTORS: usize> BlockRam<SECTORS> {
     /// [`BlockError::OutOfRange`] from the write or read if `lba` is
     /// out of bounds; [`BlockError::Io`] if the read-back does not
     /// match what was written.
-    pub fn verify_roundtrip(&mut self, lba: u64, data: &[u8; LBA_SIZE]) -> Result<(), BlockError> {
+    fn verify_roundtrip(&mut self, lba: u64, data: &[u8; LBA_SIZE]) -> Result<(), BlockError> {
         self.write_lba(lba, data)?;
         let mut readback = [0; LBA_SIZE];
         self.read_lba(lba, &mut readback)?;
@@ -132,14 +169,19 @@ impl<const SECTORS: usize> BlockRam<SECTORS> {
             Err(BlockError::Io)
         }
     }
+}
 
-    /// Sector index for `lba`, bounds-checked without indexing.
-    fn sector_index(lba: u64) -> Result<usize, BlockError> {
-        let i = usize::try_from(lba).map_err(|_| BlockError::OutOfRange)?;
-        if i >= SECTORS {
-            return Err(BlockError::OutOfRange);
-        }
-        Ok(i)
+impl<const SECTORS: usize> BlockDevice for BlockRam<SECTORS> {
+    fn capacity_lbas(&self) -> u64 {
+        SECTORS as u64
+    }
+
+    fn read_lba(&mut self, lba: u64, out: &mut [u8; LBA_SIZE]) -> Result<(), BlockError> {
+        BlockRam::read_lba(self, lba, out)
+    }
+
+    fn write_lba(&mut self, lba: u64, data: &[u8; LBA_SIZE]) -> Result<(), BlockError> {
+        BlockRam::write_lba(self, lba, data)
     }
 }
 

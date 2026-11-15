@@ -15,6 +15,7 @@ omniosk = { path = "../../crates/omniosk" }
 omni-ring = { path = "../../crates/omni-ring", default-features = false }
 omni-heap = { path = "../../crates/omni-heap" }
 omni-task = { path = "../../crates/omni-task" }
+omni-block = { path = "../../crates/omni-block" }
 
 [profile.release]
 panic = "abort"
