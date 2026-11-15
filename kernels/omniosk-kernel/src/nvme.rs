@@ -29,7 +29,13 @@ pub struct NvmePages {
 }
 
 const QSIZE: usize = 4;
-const MAGIC: &[u8] = b"OMNIOSK-NVME-OK!";
+/// I/O queue capacity. DISCOVERY (2026-11-14): QEMU rejects an SQ/CQ
+/// doorbell value >= queue size (`new_tail >= sq->size` in
+/// nvme_process_db) — with 4-entry I/O queues the 4th submission's
+/// doorbell (4) is rejected and the queue never completes again.
+/// 64 entries give a session ample submission headroom (MQES is 255+).
+const IO_QSIZE: usize = 64;
+pub const MAGIC: &[u8] = b"OMNIOSK-NVME-OK!";
 
 #[inline]
 fn mmio32(base: usize, off: usize) -> u32 {
@@ -116,9 +122,101 @@ fn write_hex(uart: &mut Serial<RawPorts>, v: u32) {
     }
 }
 
+/// Live device state after `init`: the BAR, the DMA pages, and the
+/// queue cursors the I/O operations advance. Built by `smoke` once the
+/// I/O queues exist; consumed by `read_lba`/`write_lba`.
+pub struct NvmeSession {
+    pub bar: usize,
+    pub asq: usize,
+    pub acq: usize,
+    pub iosq: usize,
+    pub iocq: usize,
+    pub readb: usize,
+    stride: u32,
+    /// Next I/O submission-queue slot.
+    iosq_tail: usize,
+    /// Next I/O completion-queue entry to poll.
+    cqe_idx: usize,
+    /// Completion phase bit for `cqe_idx`.
+    cqe_phase: u32,
+}
+
+/// Submits an I/O read of `lba` into the session's read page and waits
+/// for the completion. False on timeout or status error.
+fn io_read_lba(s: &mut NvmeSession, lba: u64) -> bool {
+    let mut sqe = [0u8; 64];
+    sqe[0] = 0x02; // Read
+    sqe[4..8].copy_from_slice(&1u32.to_le_bytes()); // NSID 1
+    sqe[24..32].copy_from_slice(&(s.readb as u64).to_le_bytes()); // PRP1
+    sqe[40..44].copy_from_slice(&(lba as u32).to_le_bytes()); // CDW10: SLBA lo
+    sqe[44..48].copy_from_slice(&((lba >> 32) as u32).to_le_bytes()); // CDW11: SLBA hi
+    sqe[48..52].copy_from_slice(&0u32.to_le_bytes()); // CDW12: NLB-1 = 0
+    let tail = s.iosq_tail;
+    submit(s.bar, s.iosq, tail, sq_db_off(1, s.stride), &sqe);
+    s.iosq_tail = (tail + 1) % IO_QSIZE;
+    let ok = wait_cqe(s.bar, s.iocq, s.cqe_idx, s.cqe_phase, cq_hd_off(1, s.stride))
+        .is_some();
+    s.cqe_idx += 1;
+    if s.cqe_idx >= QSIZE {
+        s.cqe_idx = 0;
+        s.cqe_phase = s.cqe_phase.wrapping_add(1) & 1;
+    }
+    ok
+}
+
+/// Submits an I/O write of the session's read page to `lba` and waits
+/// for the completion. False on timeout or status error.
+fn io_write_lba(s: &mut NvmeSession, lba: u64) -> bool {
+    let mut sqe = [0u8; 64];
+    sqe[0] = 0x01; // Write
+    sqe[4..8].copy_from_slice(&1u32.to_le_bytes()); // NSID 1
+    sqe[24..32].copy_from_slice(&(s.readb as u64).to_le_bytes()); // PRP1
+    sqe[40..44].copy_from_slice(&(lba as u32).to_le_bytes()); // CDW10: SLBA lo
+    sqe[44..48].copy_from_slice(&((lba >> 32) as u32).to_le_bytes()); // CDW11: SLBA hi
+    sqe[48..52].copy_from_slice(&0u32.to_le_bytes()); // CDW12: NLB-1 = 0
+    let tail = s.iosq_tail;
+    submit(s.bar, s.iosq, tail, sq_db_off(1, s.stride), &sqe);
+    s.iosq_tail = (tail + 1) % IO_QSIZE;
+    let ok = wait_cqe(s.bar, s.iocq, s.cqe_idx, s.cqe_phase, cq_hd_off(1, s.stride))
+        .is_some();
+    s.cqe_idx += 1;
+    if s.cqe_idx >= QSIZE {
+        s.cqe_idx = 0;
+        s.cqe_phase = s.cqe_phase.wrapping_add(1) & 1;
+    }
+    ok
+}
+
+/// Reads one LBA into `out` over the session's I/O queues.
+///
+/// Reserved for the `omni-block` seam: the `BlockDevice` trait lands
+/// when a second implementation exists (see crates/omni-block docs);
+/// until then this is the kernel-side callable surface.
+#[allow(dead_code)]
+pub fn read_lba(s: &mut NvmeSession, lba: u64, out: &mut [u8; 512]) -> bool {
+    if !io_read_lba(s, lba) {
+        return false;
+    }
+    for (i, slot) in out.iter_mut().enumerate() {
+        *slot = vbyte(s.readb, i);
+    }
+    true
+}
+
+/// Writes `data` (staged into the session's read page) to one LBA over
+/// the session's I/O queues.
+#[allow(dead_code)]
+pub fn write_lba(s: &mut NvmeSession, lba: u64, data: &[u8; 512]) -> bool {
+    for (i, b) in data.iter().enumerate() {
+        wbyte(s.readb, i, *b);
+    }
+    io_write_lba(s, lba)
+}
+
 /// Full device bring-up + smoke. Serial carries per-stage progress and the
-/// controller's model number. Returns false on any failure.
-pub fn smoke(p: &NvmePages) -> bool {
+/// controller's model number. Returns the live session on success (the
+/// caller may then use `read_lba`/`write_lba`); None on any failure.
+pub fn smoke(p: &NvmePages) -> Option<NvmeSession> {
     let mut uart = Serial::new(RawPorts, COM1);
 
     // ---- PCI: find the QEMU NVMe on bus 0 ----
@@ -134,7 +232,7 @@ pub fn smoke(p: &NvmePages) -> bool {
     }
     if bar == 0 {
         uart.write_str("NVME: device not found\n");
-        return false;
+        return None;
     }
 
     // Doorbell stride = 4 bytes (SeaBIOS-verified: CQ0HDBL @ 0x1004).
@@ -152,7 +250,7 @@ pub fn smoke(p: &NvmePages) -> bool {
         spins += 1;
         if spins > 100_000_000 {
             uart.write_str("NVME: disable timeout\n");
-            return false;
+            return None;
         }
     }
 
@@ -171,7 +269,7 @@ pub fn smoke(p: &NvmePages) -> bool {
         spins += 1;
         if spins > 100_000_000 {
             uart.write_str("NVME: enable timeout\n");
-            return false;
+            return None;
         }
     }
 
@@ -188,14 +286,14 @@ pub fn smoke(p: &NvmePages) -> bool {
         Some(v) => v,
         None => {
             uart.write_str("NVME: identify CQE timeout\n");
-            return false;
+            return None;
         }
     };
     if (dw3 >> 17 & 0x7FFF) != 0 {
         uart.write_str("NVME: identify status=0x");
         write_hex(&mut uart, dw3);
         uart.write_str("\n");
-        return false;
+        return None;
     }
 
     // Model number: bytes 24..88, printed trimmed.
@@ -219,7 +317,7 @@ pub fn smoke(p: &NvmePages) -> bool {
     sqe[2..4].copy_from_slice(&2u16.to_le_bytes()); // CID 2
     sqe[24..32].copy_from_slice(&(iocq as u64).to_le_bytes()); // PRP1
     sqe[40..42].copy_from_slice(&1u16.to_le_bytes()); // CQID = 1
-    sqe[42..44].copy_from_slice(&((QSIZE as u16) - 1).to_le_bytes()); // QSIZE = 3 (0-based)
+    sqe[42..44].copy_from_slice(&((IO_QSIZE as u16) - 1).to_le_bytes()); // QSIZE (0-based)
     sqe[44..46].copy_from_slice(&3u16.to_le_bytes()); // flags: PC + IEN
     sqe[46..48].copy_from_slice(&0u16.to_le_bytes()); // IRQ vector = 0
     submit(bar, asq, 1, sq_db_off(0, stride), &sqe);
@@ -240,14 +338,14 @@ pub fn smoke(p: &NvmePages) -> bool {
                 write_hex(&mut uart, vbyte(asq, i) as u32);
             }
             uart.write_str("\n");
-            return false;
+            return None;
         }
     };
     if (dw3 >> 17 & 0x7FFF) != 0 {
         uart.write_str("NVME: IOCQ status=0x");
         write_hex(&mut uart, dw3);
         uart.write_str("\n");
-        return false;
+        return None;
     }
 
     let mut sqe = [0u8; 64];
@@ -255,7 +353,7 @@ pub fn smoke(p: &NvmePages) -> bool {
     sqe[2..4].copy_from_slice(&3u16.to_le_bytes()); // CID 3
     sqe[24..32].copy_from_slice(&(iosq as u64).to_le_bytes()); // PRP1
     sqe[40..42].copy_from_slice(&1u16.to_le_bytes()); // SQID = 1
-    sqe[42..44].copy_from_slice(&((QSIZE as u16) - 1).to_le_bytes()); // QSIZE = 3 (0-based)
+    sqe[42..44].copy_from_slice(&((IO_QSIZE as u16) - 1).to_le_bytes()); // QSIZE (0-based)
     sqe[44..46].copy_from_slice(&1u16.to_le_bytes()); // SQ_FLAGS: PC
     sqe[46..48].copy_from_slice(&1u16.to_le_bytes()); // CQID = 1
     submit(bar, asq, 2, sq_db_off(0, stride), &sqe);
@@ -263,14 +361,14 @@ pub fn smoke(p: &NvmePages) -> bool {
         Some(v) => v,
         None => {
             uart.write_str("NVME: IOSQ create timeout\n");
-            return false;
+            return None;
         }
     };
     if (dw3 >> 17 & 0x7FFF) != 0 {
         uart.write_str("NVME: IOSQ status=0x");
         write_hex(&mut uart, dw3);
         uart.write_str("\n");
-        return false;
+        return None;
     }
 
     // ---- I/O: read LBA 0 into the read buffer ----
@@ -286,20 +384,20 @@ pub fn smoke(p: &NvmePages) -> bool {
         Some(v) => v,
         None => {
             uart.write_str("NVME: read timeout\n");
-            return false;
+            return None;
         }
     };
     if (dw3 >> 17 & 0x7FFF) != 0 {
         uart.write_str("NVME: read status=0x");
         write_hex(&mut uart, dw3);
         uart.write_str("\n");
-        return false;
+        return None;
     }
 
     for (i, expected) in MAGIC.iter().enumerate() {
         if vbyte(readb, i) != *expected {
             uart.write_str("NVME: data mismatch\n");
-            return false;
+            return None;
         }
     }
 
@@ -323,14 +421,14 @@ pub fn smoke(p: &NvmePages) -> bool {
         Some(v) => v,
         None => {
             uart.write_str("NVME: write timeout\n");
-            return false;
+            return None;
         }
     };
     if (dw3 >> 17 & 0x7FFF) != 0 {
         uart.write_str("NVME: write status=0x");
         write_hex(&mut uart, dw3);
         uart.write_str("\n");
-        return false;
+        return None;
     }
 
     // Zero the scratch page, then read LBA 1 back and compare.
@@ -349,23 +447,34 @@ pub fn smoke(p: &NvmePages) -> bool {
         Some(v) => v,
         None => {
             uart.write_str("NVME: write-verify read timeout\n");
-            return false;
+            return None;
         }
     };
     if (dw3 >> 17 & 0x7FFF) != 0 {
         uart.write_str("NVME: write-verify status=0x");
         write_hex(&mut uart, dw3);
         uart.write_str("\n");
-        return false;
+        return None;
     }
     for (i, expected) in WRT_MAGIC.iter().enumerate() {
         if vbyte(readb, i) != *expected {
             uart.write_str("NVME: write data mismatch\n");
-            return false;
+            return None;
         }
     }
     uart.write_str("NVME WRITE PASS\n");
-    true
+    Some(NvmeSession {
+        bar,
+        asq,
+        acq,
+        iosq,
+        iocq,
+        readb,
+        stride,
+        iosq_tail: 3,  // slots 0..2 consumed by the smoke's I/O ops
+        cqe_idx: 3,
+        cqe_phase: 1,
+    })
 }
 
 /// Raw x86_64 byte-port I/O — scoped to this module; the single `unsafe`
