@@ -14,6 +14,9 @@ bench/go-bench.txt
 
 # Lean lake build artifacts
 proofs/.lake/
-tests/
+# Kernel test artifacts (the tests/ dirs themselves hold tracked
+# integration tests — NEVER a bare `tests/` pattern here: it ate
+# crates/*/tests/model.rs on a fresh clone)
 kernels/omniosk-kernel/trace.log
 kernels/omniosk-kernel/tests/serial.log
+kernels/omniosk-kernel/tests/nvme.img
