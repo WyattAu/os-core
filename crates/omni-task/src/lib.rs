@@ -5,15 +5,13 @@
 //!
 //! - `no_std`, allocation-free, panic-free (every failure is a
 //!   `Result`/`Option`) — same posture as `omni-heap`.
-//! - **Deterministic**: one tick dispatches exactly one live task, the
-//!   next live task after the cursor — a given spawn/tick sequence
+//! - **Deterministic**: one tick dispatches exactly one awake task, the
+//!   next awake task after the cursor — a given spawn/tick sequence
 //!   dispatches identically on every boot.
-//! - Tasks retire themselves: a task fn returning `true` marks the slot
-//!   done; `tick` skips done slots until the table is empty.
-//!
-//! Tasks run in tick (interrupt) context: they must not block. That
-//! contract is checked by review, not by code — the smoke's sleep is a
-//! task-context user and deliberately stays outside this table.
+//! - **Cooperative sleep is a task state**: a task returns
+//!   [`TaskFlow::Sleep(n)`] and its slot skips dispatch until `n` ticks
+//!   have passed (`TaskFlow::Done` retires the slot).
+//! - Tasks run in tick (interrupt) context: they must not block.
 
 #![no_std]
 
@@ -24,14 +22,34 @@ pub enum TaskError {
     Full,
 }
 
-/// One registered task: a `run` fn plus its lifecycle flags.
+/// Per-dispatch context handed to a task fn.
+#[derive(Debug)]
+pub struct TaskCtx {
+    /// Ticks observed so far (the scheduler's monotonic tick count).
+    pub ticks: u64,
+}
+
+/// What a task wants after its dispatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskFlow {
+    /// The task is finished: its slot retires.
+    Done,
+    /// Keep the slot live; dispatch again on the next rotation.
+    Continue,
+    /// Keep the slot live; skip dispatch until `n` more ticks have
+    /// passed (cooperative sleep, tick-quantized).
+    Sleep(u64),
+}
+
+/// One registered task: a `run` fn plus its lifecycle state.
 #[derive(Clone, Copy)]
 pub struct TaskSlot {
-    /// Runs once per dispatch; returns `true` when the task is done
-    /// and its slot may retire.
-    pub run: fn() -> bool,
+    /// Runs once per dispatch (awake, cursor on this slot).
+    pub run: fn(&mut TaskCtx) -> TaskFlow,
     /// Stable identifier surfaced by `tick` for dispatch tracing.
     pub name: &'static str,
+    /// Wake tick: the slot sleeps while `wake_at > ticks`.
+    wake_at: u64,
 }
 
 /// Round-robin dispatcher over `N` fixed slots.
@@ -48,8 +66,7 @@ pub struct Scheduler<const N: usize> {
 impl<const N: usize> Scheduler<N> {
     /// Creates an empty scheduler.
     #[must_use]
-    #[allow(clippy::new_without_default)] // the kernel uses `new` directly; a
-                                          // Default impl would suggest runtime-created schedulers
+    #[allow(clippy::new_without_default)] // the kernel uses `new` directly
     pub const fn new() -> Self {
         Self {
             slots: [const { None }; N],
@@ -64,17 +81,25 @@ impl<const N: usize> Scheduler<N> {
     /// # Errors
     ///
     /// [`TaskError::Full`] when every slot is occupied.
-    pub fn spawn(&mut self, name: &'static str, run: fn() -> bool) -> Result<(), TaskError> {
+    pub fn spawn(
+        &mut self,
+        name: &'static str,
+        run: fn(&mut TaskCtx) -> TaskFlow,
+    ) -> Result<(), TaskError> {
         let slot = self
             .slots
             .iter_mut()
             .find(|s| s.is_none())
             .ok_or(TaskError::Full)?;
-        *slot = Some(TaskSlot { run, name });
+        *slot = Some(TaskSlot {
+            run,
+            name,
+            wake_at: 0,
+        });
         Ok(())
     }
 
-    /// Number of live (not done) tasks.
+    /// Number of live (not retired) tasks — sleeping tasks are live.
     #[must_use]
     pub fn live(&self) -> usize {
         self.slots.iter().filter(|s| s.is_some()).count()
@@ -82,25 +107,27 @@ impl<const N: usize> Scheduler<N> {
 
     /// Ticks observed so far.
     #[must_use]
-    pub fn ticks(&self) -> u64 {
+    pub const fn ticks(&self) -> u64 {
         self.ticks
     }
 
     /// Dispatches performed so far.
     #[must_use]
-    pub fn dispatches(&self) -> u64 {
+    pub const fn dispatches(&self) -> u64 {
         self.dispatches
     }
 
-    /// One tick: dispatch the next live task after the cursor
-    /// (round-robin, skipping done slots). Returns the dispatched
-    /// task's name, or `None` when no live task exists.
+    /// One tick: dispatch the next AWAKE task after the cursor
+    /// (round-robin, skipping done and sleeping slots). Returns the
+    /// dispatched task's name, or `None` when nothing dispatched
+    /// (empty table or every task asleep).
     ///
     /// The cursor never skips backwards and the scan is bounded by
     /// `N` — dispatch is wait-free with try semantics, mirroring the
     /// rings' posture.
     pub fn tick(&mut self) -> Option<&'static str> {
         self.ticks += 1;
+        let mut ctx = TaskCtx { ticks: self.ticks };
         for step in 0..N {
             let idx = (self.cursor + step) % N;
             let Some(task) = self.slots.get_mut(idx) else {
@@ -109,13 +136,23 @@ impl<const N: usize> Scheduler<N> {
             let Some(task_slot) = task else {
                 continue;
             };
-            let done = (task_slot.run)();
+            // Sleeping slot: skip without consuming a dispatch.
+            if task_slot.wake_at > self.ticks {
+                continue;
+            }
+            let flow = (task_slot.run)(&mut ctx);
             self.dispatches += 1;
             self.cursor = (idx + 1) % N;
             let name = task_slot.name;
-            if done {
-                // Retire through the borrow: no second indexing.
-                *task = None;
+            match flow {
+                TaskFlow::Sleep(n) => {
+                    task_slot.wake_at = self.ticks.saturating_add(n);
+                }
+                TaskFlow::Done => {
+                    // Retire through the borrow: no second indexing.
+                    *task = None;
+                }
+                TaskFlow::Continue => {}
             }
             return Some(name);
         }
@@ -129,19 +166,23 @@ mod tests {
     use core::sync::atomic::{AtomicUsize, Ordering};
 
     // Per-test counters: tests run in PARALLEL threads — a shared
-    // static would interleave (the parity-based retire here once
-    // flapped on a macos CI runner for exactly that reason).
+    // static would interleave (a parity-based retire here once flapped
+    // on a macos CI runner for exactly that reason).
     static RR_COUNT: AtomicUsize = AtomicUsize::new(0);
     static RETIRE_COUNT: AtomicUsize = AtomicUsize::new(0);
 
-    fn bump_rr() -> bool {
+    fn bump_rr(_: &mut TaskCtx) -> TaskFlow {
         RR_COUNT.fetch_add(1, Ordering::Relaxed);
-        false // never done
+        TaskFlow::Continue
     }
 
-    fn bump_retire() -> bool {
+    fn bump_retire(_: &mut TaskCtx) -> TaskFlow {
         let n = RETIRE_COUNT.fetch_add(1, Ordering::Relaxed);
-        n + 1 >= 3 // done on the third dispatch
+        if n + 1 >= 3 {
+            TaskFlow::Done
+        } else {
+            TaskFlow::Continue
+        }
     }
 
     #[test]
@@ -151,7 +192,6 @@ mod tests {
         assert!(s.spawn("a", bump_rr).is_ok());
         assert!(s.spawn("b", bump_rr).is_ok());
         assert!(s.spawn("c", bump_rr).is_ok());
-        // Three ticks dispatch a, b, c in spawn order.
         assert_eq!(s.tick(), Some("a"));
         assert_eq!(s.tick(), Some("b"));
         assert_eq!(s.tick(), Some("c"));
@@ -167,7 +207,7 @@ mod tests {
 
     #[test]
     fn done_tasks_retire_and_free_their_slot() {
-        RR_COUNT.store(0, Ordering::Relaxed);
+        RETIRE_COUNT.store(0, Ordering::Relaxed);
         let mut s: Scheduler<4> = Scheduler::new();
         assert!(s.spawn("x", bump_retire).is_ok());
         assert_eq!(s.tick(), Some("x"));
@@ -187,5 +227,30 @@ mod tests {
         assert!(s.spawn("a", bump_rr).is_ok());
         assert!(s.spawn("b", bump_rr).is_ok());
         assert_eq!(s.spawn("c", bump_rr), Err(TaskError::Full));
+    }
+
+    static SLEEPY_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+    fn sleepy_always(_: &mut TaskCtx) -> TaskFlow {
+        SLEEPY_COUNT.fetch_add(1, Ordering::Relaxed);
+        TaskFlow::Sleep(2)
+    }
+
+    #[test]
+    fn sleeping_slots_skip_without_starving_others() {
+        RR_COUNT.store(0, Ordering::Relaxed);
+        SLEEPY_COUNT.store(0, Ordering::Relaxed);
+        let mut s: Scheduler<4> = Scheduler::new();
+        // A task that sleeps 2 ticks after every dispatch.
+        assert!(s.spawn("sleepy", sleepy_always).is_ok());
+        assert!(s.spawn("runner", bump_rr).is_ok());
+        // 8 ticks with Sleep(2): sleepy dispatches every 2 ticks
+        // (1, 3, 5, 7 = 4 dispatches); the runner takes the other 4 —
+        // exact counts, no starvation either way.
+        for _ in 0..8 {
+            s.tick();
+        }
+        assert_eq!(SLEEPY_COUNT.load(Ordering::Relaxed), 4, "sleepy spacing");
+        assert_eq!(RR_COUNT.load(Ordering::Relaxed), 4, "runner not starved");
     }
 }

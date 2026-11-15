@@ -1,46 +1,95 @@
 //! REQ-OS-008 model test: the scheduler's contract stated as fairness
-//! properties rather than trace-matching (fixed slots + a cursor is
-//! the kernel-honest design; a deque oracle would encode a different
+//! and sleep-spacing properties (fixed slots + a cursor is the
+//! kernel-honest design; a deque oracle would encode different
 //! rotation semantics).
 //!
 //! Properties:
-//! 1. **Exact rotation**: with `k` live tasks and no churn, one window
-//!    of `N` ticks dispatches every live task `N / k` times (±1 when
-//!    `k` does not divide `N`).
-//! 2. **No starvation under churn**: through random spawns, `tick`
+//! 1. **Exact rotation**: with `k` live Continue-tasks and no churn,
+//!    one window of `N` ticks dispatches every live task `N / k` times
+//!    (±1 when `k` does not divide `N`).
+//! 2. **Sleep spacing**: a task returning `Sleep(n)` is dispatched
+//!    with consecutive dispatches at least `n` ticks apart, and its
+//!    co-scheduled runner is never starved.
+//! 3. **No starvation under churn**: through random spawns, `tick`
 //!    never errors, and every still-live task is dispatched at least
 //!    once in any `N`-tick window.
+//!
+//! `COUNTERS`/`SLEEP_QUANTUM` are THREAD-LOCAL: the three `#[test]` fns
+//! run in parallel threads and share nothing — shared statics garbled
+//! property 2's counts mid-run when property 1/3 reset the same cells.
 
-use omni_task::{Scheduler, TaskError};
+use omni_task::{Scheduler, TaskCtx, TaskError, TaskFlow};
 use proptest::prelude::*;
 
 const N: usize = 4;
 
-static COUNTERS: [std::sync::atomic::AtomicUsize; N] = [
-    const { std::sync::atomic::AtomicUsize::new(0) },
-    const { std::sync::atomic::AtomicUsize::new(0) },
-    const { std::sync::atomic::AtomicUsize::new(0) },
-    const { std::sync::atomic::AtomicUsize::new(0) },
-];
-
-fn never0() -> bool {
-    let _ = COUNTERS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    false
-}
-fn never1() -> bool {
-    let _ = COUNTERS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    false
-}
-fn never2() -> bool {
-    let _ = COUNTERS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    false
-}
-fn never3() -> bool {
-    let _ = COUNTERS[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    false
+thread_local! {
+    static COUNTERS: [std::sync::atomic::AtomicUsize; N] =
+        const { [const { std::sync::atomic::AtomicUsize::new(0) }; N] };
+    static SLEEP_QUANTUM: std::sync::atomic::AtomicUsize =
+        const { std::sync::atomic::AtomicUsize::new(1) };
 }
 
-const NEVER_FNS: [fn() -> bool; N] = [never0, never1, never2, never3];
+fn bump(counter: usize) {
+    COUNTERS.with(|c| {
+        if let Some(slot) = c.get(counter) {
+            slot.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    });
+}
+
+fn reset_counters() {
+    COUNTERS.with(|c| {
+        for slot in c {
+            slot.store(0, std::sync::atomic::Ordering::Relaxed);
+        }
+    });
+}
+
+fn counter(counter: usize) -> usize {
+    COUNTERS.with(|c| {
+        c.get(counter)
+            .map_or(0, |a| a.load(std::sync::atomic::Ordering::Relaxed))
+    })
+}
+
+fn set_quantum(q: usize) {
+    SLEEP_QUANTUM.with(|q_cell| q_cell.store(q, std::sync::atomic::Ordering::Relaxed));
+}
+
+fn quantum() -> usize {
+    SLEEP_QUANTUM.with(|q| q.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+fn sleepy(ctx: &mut TaskCtx) -> TaskFlow {
+    let _ = ctx;
+    bump(0);
+    TaskFlow::Sleep(quantum() as u64)
+}
+
+fn runner(_ctx: &mut TaskCtx) -> TaskFlow {
+    bump(1);
+    TaskFlow::Continue
+}
+
+fn never0(_: &mut TaskCtx) -> TaskFlow {
+    bump(0);
+    TaskFlow::Continue
+}
+fn never1(_: &mut TaskCtx) -> TaskFlow {
+    bump(1);
+    TaskFlow::Continue
+}
+fn never2(_: &mut TaskCtx) -> TaskFlow {
+    bump(2);
+    TaskFlow::Continue
+}
+fn never3(_: &mut TaskCtx) -> TaskFlow {
+    bump(3);
+    TaskFlow::Continue
+}
+
+const NEVER_FNS: [fn(&mut TaskCtx) -> TaskFlow; N] = [never0, never1, never2, never3];
 const NAMES: [&str; N] = ["t0", "t1", "t2", "t3"];
 
 /// The abort-on-impossible pattern: `unwrap`/`expect`/`panic` are
@@ -58,20 +107,16 @@ macro_rules! must {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(256))]
 
-    /// Property 1: exact rotation. `k` live never-done tasks, one
-    /// window of N ticks → every live task dispatched N/k times
-    /// (±1 when k does not divide N), the rest of the table untouched.
+    /// Property 1: exact rotation with Continue-only tasks.
     #[test]
     fn exact_rotation(k in 1usize..=N) {
-        for c in &COUNTERS { c.store(0, std::sync::atomic::Ordering::Relaxed); }
+        reset_counters();
         let mut sched: Scheduler<N> = Scheduler::new();
-        for ((i, name), f) in
-            NAMES.iter().enumerate().zip(NEVER_FNS.iter()).take(k)
-        {
+        for ((slot, name), f) in NAMES.iter().enumerate().zip(NEVER_FNS.iter()).take(k) {
             let Ok(()) = sched.spawn(name, *f) else {
                 std::process::abort();
             };
-            let _ = i;
+            let _ = slot;
         }
         let mut counts = [0usize; N];
         for _ in 0..N {
@@ -85,23 +130,58 @@ proptest! {
         }
         let lo = N / k;
         let hi = N.div_ceil(k);
-        for (i, (&name, &c)) in NAMES.iter().zip(counts.iter()).enumerate() {
-            if i < k {
-                prop_assert!(c >= lo && c <= hi,
-                    "task {} ran {} times in {} ticks with {} live tasks", name, c, N, k);
-            } else {
-                prop_assert_eq!(c, 0, "empty slot {} never dispatched", i);
-            }
+        for ((_slot, &name), &c) in NAMES.iter().enumerate().zip(counts.iter()).take(k) {
+            prop_assert!(c >= lo && c <= hi,
+                "task {} ran {} times in {} ticks with {} live tasks", name, c, N, k);
+        }
+        for (empty_slot, &c) in counts.iter().enumerate().skip(k) {
+            prop_assert_eq!(c, 0, "empty slot {} never dispatched", empty_slot);
         }
         prop_assert_eq!(sched.dispatches(), N as u64, "one dispatch per tick");
         prop_assert_eq!(sched.live(), k, "no churn");
     }
 
-    /// Property 2: no starvation through churn. Random spawns; in the
+    /// Property 2: sleep spacing + fairness under sleep. The sleepy
+    /// task always returns `Sleep(quantum)`: consecutive sleepy
+    /// dispatches are at least `quantum` ticks apart (exactly quantum
+    /// when the quantum exceeds the rotation period), the sleepy task
+    /// runs ceil(W/quantum) times, and the runner takes every tick the
+    /// sleeper skips.
+    #[test]
+    fn sleep_spacing_at_least_sleep(quantum in 1usize..=3usize) {
+        reset_counters();
+        set_quantum(quantum);
+        let mut sched: Scheduler<N> = Scheduler::new();
+        assert!(sched.spawn("sleepy", sleepy).is_ok(), "capacity holds");
+        assert!(sched.spawn("runner", runner).is_ok(), "capacity holds");
+        // Under the cursor rotation the spacing is max(quantum, N):
+        // the quantum only bites when it exceeds the rotation period.
+        // Ticks 1, 1+spacing, ... up through the last window tick are
+        // ceil(W / spacing) dispatches.
+        let window = 12 * (quantum + N);
+        let mut sleepy_ticks: Vec<usize> = Vec::new();
+        for t in 1..=window {
+            if sched.tick() == Some("sleepy") {
+                sleepy_ticks.push(t);
+            }
+        }
+        prop_assert!(sleepy_ticks.len() >= 2, "sleepy dispatched repeatedly");
+        for pair in sleepy_ticks.windows(2) {
+            if let [a, b] = pair {
+                let gap = b - a;
+                prop_assert!(gap >= quantum,
+                    "sleepy spacing {} below the Sleep({}) quantum", gap, quantum);
+            }
+        }
+        prop_assert_eq!(counter(1), window - sleepy_ticks.len(),
+            "the runner takes every skipped tick");
+    }
+
+    /// Property 3: no starvation through churn. Random spawns; in the
     /// trailing window every live task is dispatched at least once.
     #[test]
     fn no_starvation_under_churn(ops in proptest::collection::vec(0usize..N, 0..40)) {
-        for c in &COUNTERS { c.store(0, std::sync::atomic::Ordering::Relaxed); }
+        reset_counters();
         let mut sched: Scheduler<N> = Scheduler::new();
         let mut next = 0usize;
         for &id in &ops {
@@ -116,11 +196,10 @@ proptest! {
                 };
                 next += 1;
             } else {
-                prop_assert_eq!(sched.spawn("x", NEVER_FNS[0]),
+                prop_assert_eq!(sched.spawn("x", never0),
                     Err(TaskError::Full), "full table rejects");
             }
         }
-        // Trailing window: every live task appears at least once.
         let live = sched.live();
         let mut seen = [0usize; N];
         for _ in 0..N {
@@ -133,11 +212,11 @@ proptest! {
                 }
             }
         }
-        for ((i, &c), name) in seen.iter().enumerate().zip(NAMES.iter()) {
-            if i < live {
+        for ((slot, &c), name) in seen.iter().enumerate().zip(NAMES.iter()) {
+            if slot < live {
                 prop_assert!(c >= 1, "live task {} dispatched in the window", name);
             } else {
-                prop_assert_eq!(c, 0, "empty slot {} never dispatched", i);
+                prop_assert_eq!(c, 0, "empty slot {} never dispatched", slot);
             }
         }
     }

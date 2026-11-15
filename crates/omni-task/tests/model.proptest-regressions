@@ -5,3 +5,7 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc 6c76e569fa2a15d9468e0fc0e84517b1c3241c091cd61aa24fd6b2adbbe73c24 # shrinks to ops = [Spawn(0), Tick, Spawn(1), Spawn(0), Tick]
+cc c1c2582c3b0d73b74c05026885276606fe97c3609dda2cf9f5a009bde00e3cb9 # shrinks to sleep = 3
+cc d158c8d4df18dda19753e71679bffdfa207619fe8d99f86042d888fe66cdd462 # shrinks to sleep = 1
+cc 22b4eec72fe06052eea7227c2e39dafcbd09840749a56547e9101c3e9bd1f439 # shrinks to sleep = 3
+cc 49633833a9d6d5d6002a47b73d8a5a8c3b587145645d2ccf948900c0a191d848 # shrinks to sleep = 1
