@@ -853,7 +853,15 @@ extern "C" fn kernel_main() -> ! {
             iosq: pages[4],
             iocq: pages[5],
         };
-        let nvme_ok = nvme::smoke(&nvme_pages);
+        let mut nvme_session = nvme::smoke(&nvme_pages);
+        let mut nvme_ok = nvme_session.is_some();
+        if let Some(mut session) = nvme_session {
+            // The retained session is the omni-block seam surface:
+            // re-read LBA 0 through read_lba and re-verify the magic.
+            let mut lba0 = [0u8; 512];
+            nvme_ok = nvme::read_lba(&mut session, 0, &mut lba0)
+                && lba0[..nvme::MAGIC.len()] == *nvme::MAGIC;
+        }
         if nvme_ok {
             uart.write_str("NVME READ PASS\n");
         } else {
