@@ -128,25 +128,29 @@ mod tests {
     use super::*;
     use core::sync::atomic::{AtomicUsize, Ordering};
 
-    static RUN_COUNT: AtomicUsize = AtomicUsize::new(0);
+    // Per-test counters: tests run in PARALLEL threads — a shared
+    // static would interleave (the parity-based retire here once
+    // flapped on a macos CI runner for exactly that reason).
+    static RR_COUNT: AtomicUsize = AtomicUsize::new(0);
+    static RETIRE_COUNT: AtomicUsize = AtomicUsize::new(0);
 
-    fn bump() -> bool {
-        RUN_COUNT.fetch_add(1, Ordering::Relaxed);
+    fn bump_rr() -> bool {
+        RR_COUNT.fetch_add(1, Ordering::Relaxed);
         false // never done
     }
 
-    fn bump_twice_then_done() -> bool {
-        let n = RUN_COUNT.fetch_add(1, Ordering::Relaxed);
-        n % 2 == 1
+    fn bump_retire() -> bool {
+        let n = RETIRE_COUNT.fetch_add(1, Ordering::Relaxed);
+        n + 1 >= 3 // done on the third dispatch
     }
 
     #[test]
     fn round_robin_order_is_deterministic() {
-        RUN_COUNT.store(0, Ordering::Relaxed);
+        RR_COUNT.store(0, Ordering::Relaxed);
         let mut s: Scheduler<4> = Scheduler::new();
-        assert!(s.spawn("a", bump).is_ok());
-        assert!(s.spawn("b", bump).is_ok());
-        assert!(s.spawn("c", bump).is_ok());
+        assert!(s.spawn("a", bump_rr).is_ok());
+        assert!(s.spawn("b", bump_rr).is_ok());
+        assert!(s.spawn("c", bump_rr).is_ok());
         // Three ticks dispatch a, b, c in spawn order.
         assert_eq!(s.tick(), Some("a"));
         assert_eq!(s.tick(), Some("b"));
@@ -163,24 +167,25 @@ mod tests {
 
     #[test]
     fn done_tasks_retire_and_free_their_slot() {
-        RUN_COUNT.store(0, Ordering::Relaxed);
+        RR_COUNT.store(0, Ordering::Relaxed);
         let mut s: Scheduler<4> = Scheduler::new();
-        assert!(s.spawn("x", bump_twice_then_done).is_ok());
+        assert!(s.spawn("x", bump_retire).is_ok());
         assert_eq!(s.tick(), Some("x"));
         assert_eq!(s.live(), 1);
         assert_eq!(s.tick(), Some("x"));
+        assert_eq!(s.tick(), Some("x"), "third dispatch returns done");
         assert_eq!(s.live(), 0, "done task retired");
         assert_eq!(s.tick(), None);
         // The retired slot is reusable.
-        assert!(s.spawn("y", bump).is_ok());
+        assert!(s.spawn("y", bump_rr).is_ok());
         assert_eq!(s.tick(), Some("y"));
     }
 
     #[test]
     fn spawn_full_is_an_error() {
         let mut s: Scheduler<2> = Scheduler::new();
-        assert!(s.spawn("a", bump).is_ok());
-        assert!(s.spawn("b", bump).is_ok());
-        assert_eq!(s.spawn("c", bump), Err(TaskError::Full));
+        assert!(s.spawn("a", bump_rr).is_ok());
+        assert!(s.spawn("b", bump_rr).is_ok());
+        assert_eq!(s.spawn("c", bump_rr), Err(TaskError::Full));
     }
 }
