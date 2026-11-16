@@ -127,6 +127,8 @@ fn write_hex(uart: &mut Serial<RawPorts>, v: u32) {
 /// I/O queues exist; consumed by `read_lba`/`write_lba`.
 pub struct NvmeSession {
     pub bar: usize,
+    /// Device-reported LBA count (NSZE from Identify-Namespace).
+    pub lbas: u64,
     pub asq: usize,
     pub acq: usize,
     pub iosq: usize,
@@ -190,11 +192,9 @@ fn io_write_lba(s: &mut NvmeSession, lba: u64) -> bool {
 use omni_block::{BlockDevice, BlockError};
 
 /// The `omni-block` contract over the NVMe I/O queues (REQ layer).
-/// Capacity is the VERIFIED extent (the smoke exercised LBAs 0 and 1);
-/// parsing the namespace size from Identify-Namespace is a follow-up.
 impl BlockDevice for NvmeSession {
     fn capacity_lbas(&self) -> u64 {
-        2
+        self.lbas
     }
 
     fn read_lba(&mut self, lba: u64, out: &mut [u8; 512]) -> Result<(), BlockError> {
@@ -270,7 +270,11 @@ pub fn smoke(p: &NvmePages) -> Option<NvmeSession> {
     let (ident, readb) = (p.ident, p.readb);
     let (iosq, iocq) = (p.iosq, p.iocq);
 
-    mmio32w(bar, 0x24, ((QSIZE as u32 - 1) << 16) | (QSIZE as u32 - 1)); // AQA
+    // AQA: 32-entry admin queues (DISCOVERY 2026-11-14: QEMU rejects
+    // doorbell values >= queue size — 4-entry admin queues would die on
+    // the 4th admin submission, the Identify-Namespace below).
+    const ADMIN_QSIZE: u32 = 32;
+    mmio32w(bar, 0x24, ((ADMIN_QSIZE - 1) << 16) | (ADMIN_QSIZE - 1)); // AQA
     mmio64w(bar, 0x28, asq as u64); // ASQ
     mmio64w(bar, 0x30, acq as u64); // ACQ
     // CC: IOSQES = 6 (64B SQEs), IOCQES = 4 (16B CQEs), EN = 1.
@@ -322,6 +326,40 @@ pub fn smoke(p: &NvmePages) -> Option<NvmeSession> {
     }
     uart.write_str("\nNVME IDENT PASS\n");
 
+    // ---- admin: Identify Namespace (op 06, CNS 0, NSID 1) ----
+    // NSZE (bytes 0-7 of the namespace data) is the device-reported
+    // LBA count: the honest capacity for the omni-block trait.
+    let mut sqe = [0u8; 64];
+    sqe[0] = 0x06; // opcode
+    sqe[2..4].copy_from_slice(&4u16.to_le_bytes()); // CID 4
+    sqe[4..8].copy_from_slice(&1u32.to_le_bytes()); // NSID 1
+    sqe[24..32].copy_from_slice(&(ident as u64).to_le_bytes()); // PRP1
+    sqe[40..44].copy_from_slice(&0u32.to_le_bytes()); // CDW10: CNS = 0
+    submit(bar, asq, 1, sq_db_off(0, stride), &sqe);
+    let dw3 = match wait_cqe(bar, acq, 1, 1, cq0_hd) {
+        Some(v) => v,
+        None => {
+            uart.write_str("NVME: identify-ns CQE timeout\n");
+            return None;
+        }
+    };
+    if (dw3 >> 17 & 0x7FFF) != 0 {
+        uart.write_str("NVME: identify-ns status=0x");
+        write_hex(&mut uart, dw3);
+        uart.write_str("\n");
+        return None;
+    }
+    let nsze = u64::from_le_bytes([
+        vbyte(ident, 0),
+        vbyte(ident, 1),
+        vbyte(ident, 2),
+        vbyte(ident, 3),
+        vbyte(ident, 4),
+        vbyte(ident, 5),
+        vbyte(ident, 6),
+        vbyte(ident, 7),
+    ]);
+
     // ---- I/O queues: CQ1 then SQ1 ----
     let mut sqe = [0u8; 64];
     sqe[0] = 0x05; // Create IOCQ
@@ -331,8 +369,8 @@ pub fn smoke(p: &NvmePages) -> Option<NvmeSession> {
     sqe[42..44].copy_from_slice(&((IO_QSIZE as u16) - 1).to_le_bytes()); // QSIZE (0-based)
     sqe[44..46].copy_from_slice(&3u16.to_le_bytes()); // flags: PC + IEN
     sqe[46..48].copy_from_slice(&0u16.to_le_bytes()); // IRQ vector = 0
-    submit(bar, asq, 1, sq_db_off(0, stride), &sqe);
-    let dw3 = match wait_cqe(bar, acq, 1, 1, cq0_hd) {
+    submit(bar, asq, 2, sq_db_off(0, stride), &sqe);
+    let dw3 = match wait_cqe(bar, acq, 2, 1, cq0_hd) {
         Some(v) => v,
         None => {
             uart.write_str("NVME: IOCQ create timeout\n");
@@ -367,8 +405,8 @@ pub fn smoke(p: &NvmePages) -> Option<NvmeSession> {
     sqe[42..44].copy_from_slice(&((IO_QSIZE as u16) - 1).to_le_bytes()); // QSIZE (0-based)
     sqe[44..46].copy_from_slice(&1u16.to_le_bytes()); // SQ_FLAGS: PC
     sqe[46..48].copy_from_slice(&1u16.to_le_bytes()); // CQID = 1
-    submit(bar, asq, 2, sq_db_off(0, stride), &sqe);
-    let dw3 = match wait_cqe(bar, acq, 2, 1, cq0_hd) {
+    submit(bar, asq, 3, sq_db_off(0, stride), &sqe);
+    let dw3 = match wait_cqe(bar, acq, 3, 1, cq0_hd) {
         Some(v) => v,
         None => {
             uart.write_str("NVME: IOSQ create timeout\n");
@@ -481,6 +519,7 @@ pub fn smoke(p: &NvmePages) -> Option<NvmeSession> {
         iosq,
         iocq,
         readb,
+        lbas: nsze,
         stride,
         iosq_tail: 3,  // slots 0..2 consumed by the smoke's I/O ops
         cqe_idx: 3,
