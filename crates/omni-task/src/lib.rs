@@ -170,6 +170,7 @@ mod tests {
     // on a macos CI runner for exactly that reason).
     static RR_COUNT: AtomicUsize = AtomicUsize::new(0);
     static RETIRE_COUNT: AtomicUsize = AtomicUsize::new(0);
+    static SLEEP_RR_COUNT: AtomicUsize = AtomicUsize::new(0);
 
     fn bump_rr(_: &mut TaskCtx) -> TaskFlow {
         RR_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -236,6 +237,11 @@ mod tests {
         TaskFlow::Sleep(2)
     }
 
+    fn bump_sleep_runner(_: &mut TaskCtx) -> TaskFlow {
+        SLEEP_RR_COUNT.fetch_add(1, Ordering::Relaxed);
+        TaskFlow::Continue
+    }
+
     #[test]
     fn sleeping_slots_skip_without_starving_others() {
         RR_COUNT.store(0, Ordering::Relaxed);
@@ -243,7 +249,7 @@ mod tests {
         let mut s: Scheduler<4> = Scheduler::new();
         // A task that sleeps 2 ticks after every dispatch.
         assert!(s.spawn("sleepy", sleepy_always).is_ok());
-        assert!(s.spawn("runner", bump_rr).is_ok());
+        assert!(s.spawn("runner", bump_sleep_runner).is_ok());
         // 8 ticks with Sleep(2): sleepy dispatches every 2 ticks
         // (1, 3, 5, 7 = 4 dispatches); the runner takes the other 4 —
         // exact counts, no starvation either way.
@@ -251,6 +257,10 @@ mod tests {
             s.tick();
         }
         assert_eq!(SLEEPY_COUNT.load(Ordering::Relaxed), 4, "sleepy spacing");
-        assert_eq!(RR_COUNT.load(Ordering::Relaxed), 4, "runner not starved");
+        assert_eq!(
+            SLEEP_RR_COUNT.load(Ordering::Relaxed),
+            4,
+            "runner not starved"
+        );
     }
 }
