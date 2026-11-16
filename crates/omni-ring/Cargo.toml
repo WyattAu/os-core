@@ -1,7 +1,10 @@
 [package]
 name = "omni-ring"
 description = "Wait-free bounded SPSC descriptor ring and lock-free bounded MPMC ring (REQ-OS-001)."
-version.workspace = true
+# 0.2.0: adds SlotTable<T, N> (the typed-payload follow-up). The
+# workspace version stays 0.1.0 for the other crates; omni-ring
+# overrides until the whole workspace ships a release train together.
+version = "0.2.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
