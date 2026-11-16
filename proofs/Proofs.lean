@@ -192,7 +192,25 @@ theorem ring_inflight_distinct (tail j1 j2 k inflight : Nat)
   have hj2 : j2 < 2 ^ k := Nat.lt_of_lt_of_le h2 hwindow
   exact hne (ring_mask_injective tail j1 j2 k hj1 hj2 heq)
 
-#print axioms ring_inflight_distinct
+/-- **Ring window injectivity** (REQ-OS-001, Phase-3): masked
+descriptor addressing is injective within one window — two descriptors
+`h1 + j1`, `h1 + j2` with distinct `j` (both below the capacity)
+occupy distinct slots. This is the anti-aliasing guarantee that makes
+FIFO order meaningful: a value written into descriptor `d` cannot be
+overwritten by a write to another in-flight descriptor, so pop order =
+push order. Generalizes the admin-CQE window analysis. -/
+theorem ring_window_injective (h1 cap j1 j2 : Nat)
+    (hc : 0 < cap) (hj1 : j1 < cap) (hj2 : j2 < cap)
+    (heq : (h1 + j1) % cap = (h1 + j2) % cap) :
+    j1 = j2 := by
+  have e1 : (h1 + j1) % cap = (h1 % cap + j1) % cap := by
+    rw [Nat.add_mod, Nat.mod_eq_of_lt hj1]
+  have e2 : (h1 + j2) % cap = (h1 % cap + j2) % cap := by
+    rw [Nat.add_mod, Nat.mod_eq_of_lt hj2]
+  rw [e1, e2] at heq
+  exact mod_window_injective (h1 % cap) j1 j2 cap
+    (Nat.mod_lt _ hc) hj1 hj2 heq
+
 #print axioms ring_index_bounded
 #print axioms ring_mask_bounded
 #print axioms perm_pack_bounded
@@ -204,3 +222,5 @@ theorem ring_inflight_distinct (tail j1 j2 k inflight : Nat)
 #print axioms heap_page_in_range
 #print axioms mod_window_injective
 #print axioms ring_mask_injective
+#print axioms ring_inflight_distinct
+#print axioms ring_window_injective
