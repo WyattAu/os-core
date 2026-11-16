@@ -668,6 +668,28 @@ fn task_blink(_ctx: &mut TaskCtx) -> TaskFlow {
     TaskFlow::Continue
 }
 
+/// Demo task C: sleeps 5 ticks after every dispatch (the Sleep-state
+/// witness). First/last dispatch ticks land in statics for the smoke's
+/// spacing assertion.
+static SLEEPER_RUNS: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+static SLEEPER_FIRST: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+static SLEEPER_LAST: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+fn task_sleeper(ctx: &mut TaskCtx) -> TaskFlow {
+    use core::sync::atomic::Ordering;
+    let t = ctx.ticks as usize;
+    if SLEEPER_FIRST.load(Ordering::Relaxed) == 0 {
+        SLEEPER_FIRST.store(t, Ordering::Relaxed);
+    } else {
+        SLEEPER_LAST.store(t, Ordering::Relaxed);
+    }
+    let _ = SLEEPER_RUNS.fetch_add(1, Ordering::Relaxed);
+    TaskFlow::Sleep(5)
+}
+
 /// Demo task B: retires after 3 dispatches (the retirement witness).
 fn task_retire(_ctx: &mut TaskCtx) -> TaskFlow {
     let n = RETIRE_RUNS.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
@@ -901,6 +923,7 @@ extern "C" fn kernel_main() -> ! {
     let mut fresh = Scheduler::new();
     let _ = fresh.spawn("blink", task_blink);
     let _ = fresh.spawn("retire", task_retire);
+    let _ = fresh.spawn("sleeper", task_sleeper);
     // SAFETY: see above.
     unsafe { *sched = Some(fresh) };
 
@@ -921,7 +944,13 @@ extern "C" fn kernel_main() -> ! {
     }
     // SAFETY: see above; the scheduler is still initialized.
     let live_ok = unsafe { (*sched).as_mut() }
-        .is_some_and(|s| s.live() == 1);
+        .is_some_and(|s| s.live() == 2);
+    let s_runs = SLEEPER_RUNS.load(core::sync::atomic::Ordering::Relaxed);
+    let s_first = SLEEPER_FIRST.load(core::sync::atomic::Ordering::Relaxed);
+    let s_last = SLEEPER_LAST.load(core::sync::atomic::Ordering::Relaxed);
+    let sleep_ok = s_runs >= 3
+        && s_last >= s_first
+        && (s_last - s_first) >= 5 * (s_runs - 2);
     if rotation_ok && retire_ok && live_ok {
         uart.write_str("TASK PASS\n");
     } else {
