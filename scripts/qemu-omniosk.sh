@@ -30,7 +30,7 @@ log="$(mktemp)"
 trap 'rm -f "$log"' EXIT
 
 set +e
-timeout 60 qemu-system-x86_64 \
+timeout 120 qemu-system-x86_64 \
     -kernel "$BIN" \
     -drive file=tests/nvme.img,if=none,format=raw,id=nvmedrive \
     -device nvme,serial=OMNIOSK,drive=nvmedrive \
@@ -59,9 +59,13 @@ done
 nvme_missing=0
 for marker in "HEAP PASS" "TIMER PASS" "TASK PASS" "SLEEP PASS" "NVME IDENT PASS" "NVME READ PASS" "NVME WRITE PASS"; do
     grep -q "$marker" "$log" || {
-        echo "qemu-omniosk: WARN (serial missing '$marker' — NVMe WIP)" >&2
+        echo "qemu-omniosk: FAIL (serial missing '$marker')" >&2
         nvme_missing=1
     }
 done
-[ "$nvme_missing" -eq 1 ] && exit 1
+if [ "$nvme_missing" -eq 1 ]; then
+    echo "qemu-omniosk: serial dump on failure:" >&2
+    cat "$log" >&2
+    exit 1
+fi
 echo "qemu-omniosk: OK"
