@@ -1045,10 +1045,6 @@ extern "C" fn kernel_main() -> ! {
     // full rotation) is the known ISR-context behavior.
     let blockcheck_fail =
         BLOCKCHECK_FAIL.load(core::sync::atomic::Ordering::Relaxed);
-    let bc_io_fail = BC_IO_FAIL.load(core::sync::atomic::Ordering::Relaxed);
-    let bc_magic_fail =
-        BC_MAGIC_FAIL.load(core::sync::atomic::Ordering::Relaxed);
-    let _ = (bc_read_fail, bc_io_fail, bc_magic_fail);
     if rotation_ok && retire_ok && live_ok && sleep_ok && blockcheck_fail == 0 {
         uart.write_str("TASK PASS\n");
     } else {
@@ -1070,15 +1066,6 @@ extern "C" fn kernel_main() -> ! {
         write_hex32(&mut uart, s_dispatches);
         uart.write_str(" slp_runs=");
         write_hex32(&mut uart, s_runs as u32);
-        uart.write_str(" range_fail=");
-        write_hex32(&mut uart,
-            BC_RANGE_FAIL.load(core::sync::atomic::Ordering::Relaxed) as u32);
-        uart.write_str(" io_fail=");
-        write_hex32(&mut uart,
-            BC_IO_FAIL.load(core::sync::atomic::Ordering::Relaxed) as u32);
-        uart.write_str(" magic_fail=");
-        write_hex32(&mut uart,
-            BC_MAGIC_FAIL.load(core::sync::atomic::Ordering::Relaxed) as u32);
         uart.write_str("\n");
     }
 
