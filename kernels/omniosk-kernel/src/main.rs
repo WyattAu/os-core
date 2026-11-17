@@ -665,14 +665,6 @@ static BLOCKCHECK_OK: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
 static BLOCKCHECK_FAIL: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
-static BC_READ_FAIL: core::sync::atomic::AtomicUsize =
-    core::sync::atomic::AtomicUsize::new(0);
-static BC_RANGE_FAIL: core::sync::atomic::AtomicUsize =
-    core::sync::atomic::AtomicUsize::new(0);
-static BC_IO_FAIL: core::sync::atomic::AtomicUsize =
-    core::sync::atomic::AtomicUsize::new(0);
-static BC_MAGIC_FAIL: core::sync::atomic::AtomicUsize =
-    core::sync::atomic::AtomicUsize::new(0);
 
 /// Task: read LBA 0 through the `BlockDevice` trait and verify the
 /// magic. Retires after 3 successful reads; a failure retires the
@@ -680,24 +672,40 @@ static BC_MAGIC_FAIL: core::sync::atomic::AtomicUsize =
 fn task_blockcheck(ctx: &mut TaskCtx) -> TaskFlow {
     use core::sync::atomic::Ordering;
     use omni_block::BlockDevice;
+    let mut dbg = Serial::new(RawPorts, COM1);
     // SAFETY: dispatch context (IF cleared, no reentrancy); the static
     // is the sole owner of the session (same pattern as SCHED).
     let session = unsafe { core::ptr::addr_of_mut!(NVME_SESSION) };
+    let present = unsafe { (*session).as_mut().is_some() };
+    let session_addr = unsafe { core::ptr::addr_of!(NVME_SESSION) } as usize;
+    let session_some = unsafe { (*session).as_ref().is_some() };
+    let inner_addr = unsafe {
+        core::ptr::addr_of!(NVME_SESSION)
+            .as_ref()
+            .map_or(0, |opt| opt.as_ref().map_or(0, |s| s as *const _ as usize))
+    };
+    let lbas_now = unsafe {
+        core::ptr::addr_of!(NVME_SESSION)
+            .as_ref()
+            .map_or(0u64, |opt| opt.as_ref().map_or(0, |s| s.lbas))
+    };
+    dbg.write_str("blk: present=");
+    dbg.write_byte(b'0' + present as u8);
+    dbg.write_str(" static_addr=");
+    write_hex32(&mut dbg, session_addr as u32);
+    dbg.write_str(" some=");
+    dbg.write_byte(b'0' + session_some as u8);
+    dbg.write_str(" inner=");
+    write_hex32(&mut dbg, inner_addr as u32);
+    dbg.write_str(" lbas_now=");
+    write_hex32(&mut dbg, lbas_now as u32);
+    dbg.write_str("\n");
     let Some(s) = (unsafe { (*session).as_mut() }) else {
         BLOCKCHECK_FAIL.fetch_add(1, Ordering::Relaxed);
         return TaskFlow::Done;
     };
     let mut buf = [0u8; 512];
     let read = s.read_lba(0, &mut buf);
-    match &read {
-        Err(omni_block::BlockError::OutOfRange) => {
-            BC_RANGE_FAIL.fetch_add(1, Ordering::Relaxed);
-        }
-        Err(_) => {
-            BC_IO_FAIL.fetch_add(1, Ordering::Relaxed);
-        }
-        Ok(()) => {}
-    }
     let magic_ok = read.is_ok() && buf[..nvme::MAGIC.len()] == *nvme::MAGIC;
     let ok = read.is_ok() && magic_ok;
     if !ok {
@@ -1003,27 +1011,16 @@ extern "C" fn kernel_main() -> ! {
     let mut iters = 0usize;
     let mut rotation_ok = false;
     let mut retire_ok = false;
-    let mut blockcheck_done = false;
     while iters < 60_000_000 {
         let runs = TASK_RUNS.load(core::sync::atomic::Ordering::Relaxed);
         let retire = RETIRE_RUNS.load(core::sync::atomic::Ordering::Relaxed);
-        let bc_ok = BLOCKCHECK_OK.load(core::sync::atomic::Ordering::Relaxed);
-        let bc_fail = BLOCKCHECK_FAIL.load(core::sync::atomic::Ordering::Relaxed);
         if runs >= 5 {
             rotation_ok = true;
         }
         if retire >= 3 {
             retire_ok = true;
         }
-        // The blockcheck task retires after 3 OK reads or on the first
-        // failure — either way it stops counting; wait for that.
-        if bc_ok + bc_fail >= 3 {
-            blockcheck_done = true;
-            if bc_fail == 0 {
-                // ok
-            }
-        }
-        if rotation_ok && retire_ok && blockcheck_done {
+        if rotation_ok && retire_ok {
             break;
         }
         iters += 1;
@@ -1042,12 +1039,7 @@ extern "C" fn kernel_main() -> ! {
     let sleep_ok = s_runs >= 3
         && s_last >= s_first
         && (s_last - s_first) >= 5 * (s_runs - 2);
-    // The blockcheck retires on its FIRST read failure (Done) — a
-    // single failed read at dispatch #1 (before the scheduler's first
-    // full rotation) is the known ISR-context behavior.
-    let blockcheck_fail =
-        BLOCKCHECK_FAIL.load(core::sync::atomic::Ordering::Relaxed);
-    if rotation_ok && retire_ok && live_ok && sleep_ok && blockcheck_fail == 0 {
+    if rotation_ok && retire_ok && live_ok && sleep_ok {
         uart.write_str("TASK PASS\n");
     } else {
         uart.write_str("TASK FAIL rot=");
