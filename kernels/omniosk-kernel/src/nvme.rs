@@ -37,6 +37,10 @@ const QSIZE: usize = 4;
 const IO_QSIZE: usize = 64;
 pub const MAGIC: &[u8] = b"OMNIOSK-NVME-OK!";
 
+/// The NSZE parsed from Identify-Namespace (diagnostics surface).
+pub static LAST_NSZE: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
 #[inline]
 fn mmio32(base: usize, off: usize) -> u32 {
     unsafe { core::ptr::read_volatile((base + off) as *const u32) }
@@ -359,6 +363,7 @@ pub fn smoke(p: &NvmePages) -> Option<NvmeSession> {
         vbyte(ident, 6),
         vbyte(ident, 7),
     ]);
+    LAST_NSZE.store(nsze, core::sync::atomic::Ordering::Relaxed);
 
     // ---- I/O queues: CQ1 then SQ1 ----
     let mut sqe = [0u8; 64];

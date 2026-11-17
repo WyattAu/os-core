@@ -655,6 +655,62 @@ fn timer_smoke(min_ticks: usize, max_iterations: usize) -> usize {
 /// dispatch while it is absent (pre-registration ticks are safe).
 static mut SCHED: Option<Scheduler<4>> = None;
 
+/// The live NVMe session, handed to the blockcheck task by kernel_main
+/// after the smoke (the omni-block seam, task-consumed).
+static mut NVME_SESSION: Option<nvme::NvmeSession> = None;
+
+/// Blockcheck witnesses: 3 successful LBA-0 reads through the
+/// `BlockDevice` trait with zero failures = TASK PASS contribution.
+static BLOCKCHECK_OK: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+static BLOCKCHECK_FAIL: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+static BC_RANGE_FAIL: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+static BC_IO_FAIL: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+static BC_MAGIC_FAIL: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+/// Task: read LBA 0 through the `BlockDevice` trait and verify the
+/// magic. Retires after 3 successful reads; a failure retires the
+/// task too and latches the fail kind (TASK FAIL).
+fn task_blockcheck(ctx: &mut TaskCtx) -> TaskFlow {
+    use core::sync::atomic::Ordering;
+    use omni_block::BlockDevice;
+    // SAFETY: dispatch context (IF cleared, no reentrancy); the static
+    // is the sole owner of the session (same pattern as SCHED).
+    let session = unsafe { core::ptr::addr_of_mut!(NVME_SESSION) };
+    let Some(s) = (unsafe { (*session).as_mut() }) else {
+        BLOCKCHECK_FAIL.fetch_add(1, Ordering::Relaxed);
+        return TaskFlow::Done;
+    };
+    let mut buf = [0u8; 512];
+    let read = s.read_lba(0, &mut buf);
+    match &read {
+        Err(omni_block::BlockError::OutOfRange) => {
+            BC_RANGE_FAIL.fetch_add(1, Ordering::Relaxed);
+        }
+        Err(_) => {
+            BC_IO_FAIL.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(()) => {}
+    }
+    let magic_ok = read.is_ok() && buf[..nvme::MAGIC.len()] == *nvme::MAGIC;
+    let ok = read.is_ok() && magic_ok;
+    if !ok {
+        BLOCKCHECK_FAIL.fetch_add(1, Ordering::Relaxed);
+        return TaskFlow::Done;
+    }
+    let _ = ctx;
+    let n = BLOCKCHECK_OK.fetch_add(1, Ordering::Relaxed) + 1;
+    if n >= 3 {
+        TaskFlow::Done
+    } else {
+        TaskFlow::Continue
+    }
+}
+
 /// Dispatch bookkeeping for the smoke: a never-done task proves the
 /// rotation, a retire-after-3 task proves slot retirement.
 static TASK_RUNS: core::sync::atomic::AtomicUsize =
@@ -881,7 +937,7 @@ extern "C" fn kernel_main() -> ! {
         };
         let mut nvme_session = nvme::smoke(&nvme_pages);
         let mut nvme_ok = nvme_session.is_some();
-        if let Some(mut session) = nvme_session {
+        if let Some(session) = nvme_session.as_mut() {
             // The retained session implements omni_block::BlockDevice —
             // the seam surface: re-read LBA 0 through the trait and
             // re-verify the magic.
@@ -896,6 +952,20 @@ extern "C" fn kernel_main() -> ! {
             uart.write_str("NVME READ PASS\n");
         } else {
             uart.write_str("NVME FAIL\n");
+        }
+        // Hand the live session (if any) to the blockcheck task (the
+        // omni-task/omni-block composition on bare metal). Moving out
+        // of the option: the local is dead past this point.
+        let handed = if let Some(session) = nvme_session.take() {
+            // SAFETY: single-threaded boot context; the static is the
+            // sole owner of the session past this point.
+            unsafe { core::ptr::addr_of_mut!(NVME_SESSION).write(Some(session)) };
+            true
+        } else {
+            false
+        };
+        if !handed && nvme_ok {
+            nvme_ok = false; // session lost: the task cannot verify
         }
     }
 
@@ -924,62 +994,84 @@ extern "C" fn kernel_main() -> ! {
     let _ = fresh.spawn("blink", task_blink);
     let _ = fresh.spawn("retire", task_retire);
     let _ = fresh.spawn("sleeper", task_sleeper);
+    let _ = fresh.spawn("blockcheck", task_blockcheck);
     // SAFETY: see above.
     unsafe { *sched = Some(fresh) };
 
     let mut iters = 0usize;
     let mut rotation_ok = false;
     let mut retire_ok = false;
-    while iters < 20_000_000 {
+    let mut blockcheck_done = false;
+    while iters < 60_000_000 {
         let runs = TASK_RUNS.load(core::sync::atomic::Ordering::Relaxed);
         let retire = RETIRE_RUNS.load(core::sync::atomic::Ordering::Relaxed);
+        let bc_ok = BLOCKCHECK_OK.load(core::sync::atomic::Ordering::Relaxed);
+        let bc_fail = BLOCKCHECK_FAIL.load(core::sync::atomic::Ordering::Relaxed);
         if runs >= 5 {
             rotation_ok = true;
-            if retire >= 3 {
-                retire_ok = true;
-                break;
+        }
+        if retire >= 3 {
+            retire_ok = true;
+        }
+        // The blockcheck task retires after 3 OK reads or on the first
+        // failure — either way it stops counting; wait for that.
+        if bc_ok + bc_fail >= 3 {
+            blockcheck_done = true;
+            if bc_fail == 0 {
+                // ok
             }
+        }
+        if rotation_ok && retire_ok && blockcheck_done {
+            break;
         }
         iters += 1;
     }
+    let s_dispatches = unsafe {
+        (*sched).as_ref().map_or(0u32, |s| s.dispatches() as u32)
+    };
     // SAFETY: see above; the scheduler is still initialized.
+    // blink + sleeper always live; blockcheck lives until its 3rd
+    // successful read (2-3 live at wait-exit, timing-dependent).
     let live_ok = unsafe { (*sched).as_mut() }
-        .is_some_and(|s| s.live() == 2);
+        .is_some_and(|s| (2..=3).contains(&s.live()));
     let s_runs = SLEEPER_RUNS.load(core::sync::atomic::Ordering::Relaxed);
     let s_first = SLEEPER_FIRST.load(core::sync::atomic::Ordering::Relaxed);
     let s_last = SLEEPER_LAST.load(core::sync::atomic::Ordering::Relaxed);
     let sleep_ok = s_runs >= 3
         && s_last >= s_first
         && (s_last - s_first) >= 5 * (s_runs - 2);
-    if rotation_ok && retire_ok && live_ok {
+    // The blockcheck retires on its FIRST read failure (Done) — a
+    // single failed read at dispatch #1 (before the scheduler's first
+    // full rotation) is the known ISR-context behavior.
+    let blockcheck_fail =
+        BLOCKCHECK_FAIL.load(core::sync::atomic::Ordering::Relaxed);
+    let bc_read_fail = BC_READ_FAIL.load(core::sync::atomic::Ordering::Relaxed);
+    let bc_io_fail = BC_IO_FAIL.load(core::sync::atomic::Ordering::Relaxed);
+    let bc_magic_fail =
+        BC_MAGIC_FAIL.load(core::sync::atomic::Ordering::Relaxed);
+    let _ = (bc_read_fail, bc_io_fail, bc_magic_fail);
+    if rotation_ok && retire_ok && live_ok && sleep_ok && blockcheck_fail == 0 {
         uart.write_str("TASK PASS\n");
     } else {
-        uart.write_str("TASK FAIL (rot=");
+        uart.write_str("TASK FAIL rot=");
         uart.write_byte(b'0' + rotation_ok as u8);
         uart.write_str(" ret=");
         uart.write_byte(b'0' + retire_ok as u8);
         uart.write_str(" live=");
         uart.write_byte(b'0' + live_ok as u8);
-        uart.write_str(" runs=");
+        uart.write_str(" slp=");
+        uart.write_byte(b'0' + sleep_ok as u8);
+        uart.write_str(" bc_ok=");
         write_hex32(&mut uart,
-            TASK_RUNS.load(core::sync::atomic::Ordering::Relaxed) as u32);
-        uart.write_str(" ret_runs=");
+            BLOCKCHECK_OK.load(core::sync::atomic::Ordering::Relaxed) as u32);
+        uart.write_str(" bc_fail=");
         write_hex32(&mut uart,
-            RETIRE_RUNS.load(core::sync::atomic::Ordering::Relaxed) as u32);
-        // Scheduler state: initialized? live? dispatches?
-        let sched = unsafe { core::ptr::addr_of_mut!(SCHED) };
-        // SAFETY: single-threaded diagnostics context.
-        let (is_some, live, dispatches) = unsafe { (*sched).as_mut() }
-            .map_or((0u8, 0usize, 0u64), |s| {
-                (1u8, s.live(), s.dispatches())
-            });
-        uart.write_str(" sch=");
-        uart.write_byte(b'0' + is_some);
-        uart.write_str(" live=");
-        write_hex32(&mut uart, live as u32);
+            BLOCKCHECK_FAIL.load(core::sync::atomic::Ordering::Relaxed) as u32);
         uart.write_str(" disp=");
-        write_hex32(&mut uart, dispatches as u32);
-        uart.write_str(")\n");
+        write_hex32(&mut uart, s_dispatches);
+        uart.write_str(" slp_runs=");
+        write_hex32(&mut uart, s_runs as u32);
+        uart.write_str("\n");
     }
 
     // ---- sleep: interrupt-driven halt for ~250 ms of ticks ----
