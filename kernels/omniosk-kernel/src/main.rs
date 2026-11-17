@@ -665,6 +665,8 @@ static BLOCKCHECK_OK: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
 static BLOCKCHECK_FAIL: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
+static BC_READ_FAIL: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
 static BC_RANGE_FAIL: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
 static BC_IO_FAIL: core::sync::atomic::AtomicUsize =
