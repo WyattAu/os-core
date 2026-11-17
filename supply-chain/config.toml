@@ -76,10 +76,6 @@ criteria = "safe-to-run"
 version = "1.6.0"
 criteria = "safe-to-deploy"
 
-[[exemptions.cc]]
-version = "1.6.0"
-criteria = "safe-to-run"
-
 [[exemptions.cfg-if]]
 version = "1.0.5"
 criteria = "safe-to-deploy"
@@ -136,10 +132,6 @@ criteria = "safe-to-run"
 version = "0.8.23"
 criteria = "safe-to-deploy"
 
-[[exemptions.crossbeam-utils]]
-version = "0.8.23"
-criteria = "safe-to-run"
-
 [[exemptions.crunchy]]
 version = "0.2.4"
 criteria = "safe-to-run"
@@ -159,10 +151,6 @@ criteria = "safe-to-run"
 [[exemptions.find-msvc-tools]]
 version = "0.1.14"
 criteria = "safe-to-deploy"
-
-[[exemptions.find-msvc-tools]]
-version = "0.1.14"
-criteria = "safe-to-run"
 
 [[exemptions.fnv]]
 version = "1.0.7"
@@ -191,10 +179,6 @@ criteria = "safe-to-deploy"
 [[exemptions.generator]]
 version = "0.8.10"
 criteria = "safe-to-deploy"
-
-[[exemptions.generator]]
-version = "0.8.10"
-criteria = "safe-to-run"
 
 [[exemptions.getrandom]]
 version = "0.3.4"
@@ -275,10 +259,6 @@ criteria = "safe-to-deploy"
 [[exemptions.loom]]
 version = "0.7.2"
 criteria = "safe-to-deploy"
-
-[[exemptions.loom]]
-version = "0.7.2"
-criteria = "safe-to-run"
 
 [[exemptions.matchers]]
 version = "0.2.0"
@@ -412,10 +392,6 @@ criteria = "safe-to-run"
 version = "1.0.23"
 criteria = "safe-to-deploy"
 
-[[exemptions.rustversion]]
-version = "1.0.23"
-criteria = "safe-to-run"
-
 [[exemptions.rusty-fork]]
 version = "0.3.1"
 criteria = "safe-to-run"
@@ -431,10 +407,6 @@ criteria = "safe-to-run"
 [[exemptions.scoped-tls]]
 version = "1.0.1"
 criteria = "safe-to-deploy"
-
-[[exemptions.scoped-tls]]
-version = "1.0.1"
-criteria = "safe-to-run"
 
 [[exemptions.serde]]
 version = "1.0.229"
@@ -467,10 +439,6 @@ criteria = "safe-to-deploy"
 [[exemptions.shlex]]
 version = "2.0.1"
 criteria = "safe-to-deploy"
-
-[[exemptions.shlex]]
-version = "2.0.1"
-criteria = "safe-to-run"
 
 [[exemptions.signal-hook-registry]]
 version = "1.4.8"
@@ -627,10 +595,6 @@ criteria = "safe-to-deploy"
 [[exemptions.windows-result]]
 version = "0.4.1"
 criteria = "safe-to-deploy"
-
-[[exemptions.windows-result]]
-version = "0.4.1"
-criteria = "safe-to-run"
 
 [[exemptions.windows-sys]]
 version = "0.61.2"
