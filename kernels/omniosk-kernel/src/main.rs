@@ -1008,10 +1008,14 @@ extern "C" fn kernel_main() -> ! {
     // SAFETY: see above.
     unsafe { *sched = Some(fresh) };
 
-    let mut iters = 0usize;
+    // Tick-count-based window: 400 ticks (~400 ms at the PIT's ~1 kHz)
+    // regardless of TCG speed — the iteration count varies inversely
+    // with the emulation speed, the tick count does not.
+    let deadline = TIMER_TICKS.load(core::sync::atomic::Ordering::Relaxed) + 400;
     let mut rotation_ok = false;
     let mut retire_ok = false;
-    while iters < 60_000_000 {
+    let mut trace_printed = 0usize;
+    while TIMER_TICKS.load(core::sync::atomic::Ordering::Relaxed) < deadline {
         let runs = TASK_RUNS.load(core::sync::atomic::Ordering::Relaxed);
         let retire = RETIRE_RUNS.load(core::sync::atomic::Ordering::Relaxed);
         if runs >= 5 {
@@ -1023,7 +1027,13 @@ extern "C" fn kernel_main() -> ! {
         if rotation_ok && retire_ok {
             break;
         }
-        iters += 1;
+        // Diagnostic: the first 20 tick numbers (ISR rotation trace).
+        if trace_printed < 20 {
+            let _ = write_hex32(&mut uart,
+                TIMER_TICKS.load(core::sync::atomic::Ordering::Relaxed) as u32);
+            let _ = uart.write_str(" ");
+            trace_printed += 1;
+        }
     }
     let s_dispatches = unsafe {
         (*sched).as_ref().map_or(0u32, |s| s.dispatches() as u32)
