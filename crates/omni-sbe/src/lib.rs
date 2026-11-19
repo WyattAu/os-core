@@ -182,6 +182,102 @@ impl<'a> SbeDecoder<'a> {
     }
 }
 
+/// A mutable SBE frame writer. Writes the 8-byte header and typed
+/// fields at explicit offsets — the caller owns the layout (matching
+/// a schema template). No allocation, no panics.
+pub struct SbeEncoder<'a> {
+    frame: &'a mut [u8],
+}
+
+impl<'a> SbeEncoder<'a> {
+    /// Wraps a frame buffer for writing. The frame is not zeroed —
+    /// the caller initializes the fields they need.
+    #[must_use]
+    pub const fn new(frame: &'a mut [u8]) -> Self {
+        Self { frame }
+    }
+
+    /// Writes the 8-byte SBE message header.
+    pub fn write_header(
+        &mut self,
+        block_length: u16,
+        template_id: u16,
+        schema_id: u16,
+        version: u16,
+    ) {
+        let hdr = consts::HEADER_LEN;
+        if hdr < 8 || self.frame.len() < hdr {
+            return;
+        }
+        self.frame[0..2].copy_from_slice(&block_length.to_le_bytes());
+        self.frame[2..4].copy_from_slice(&template_id.to_le_bytes());
+        self.frame[4..6].copy_from_slice(&schema_id.to_le_bytes());
+        self.frame[6..8].copy_from_slice(&version.to_le_bytes());
+    }
+
+    /// Writes a little-endian scalar of `N` bytes at `offset`.
+    /// Returns `false` when the field extent runs past the frame.
+    pub fn put_scalar<const N: usize>(&mut self, offset: usize, value: &[u8; N]) -> bool {
+        let end = match offset.checked_add(N) {
+            Some(e) => e,
+            None => return false,
+        };
+        if end > self.frame.len() {
+            return false;
+        }
+        self.frame[offset..end].copy_from_slice(value);
+        true
+    }
+
+    /// Writes a `u16` field at `offset` (little-endian).
+    pub fn put_u16(&mut self, offset: usize, value: u16) -> bool {
+        self.put_scalar(offset, &value.to_le_bytes())
+    }
+
+    /// Writes a `u32` field at `offset` (little-endian).
+    pub fn put_u32(&mut self, offset: usize, value: u32) -> bool {
+        self.put_scalar(offset, &value.to_le_bytes())
+    }
+
+    /// Writes a `u64` field at `offset` (little-endian).
+    pub fn put_u64(&mut self, offset: usize, value: u64) -> bool {
+        self.put_scalar(offset, &value.to_le_bytes())
+    }
+
+    /// Writes a repeating group's dimensions header at `offset`:
+    /// blockLength + numInGroup (each `u16` LE).
+    pub fn put_group_header(
+        &mut self,
+        offset: usize,
+        block_length: u16,
+        num_in_group: u16,
+    ) -> bool {
+        if offset + consts::GROUP_HEADER_LEN > self.frame.len() {
+            return false;
+        }
+        self.frame[offset..offset + 2].copy_from_slice(&block_length.to_le_bytes());
+        self.frame[offset + 2..offset + 4].copy_from_slice(&num_in_group.to_le_bytes());
+        true
+    }
+
+    /// Writes a varData field at `offset`: length prefix + payload.
+    /// Returns `false` when the prefix or payload would overrun.
+    pub fn put_var_data(&mut self, offset: usize, data: &[u8]) -> bool {
+        let len_byte = offset;
+        let payload_start = offset + 1;
+        let payload_end = match payload_start.checked_add(data.len()) {
+            Some(e) => e,
+            None => return false,
+        };
+        if payload_end > self.frame.len() {
+            return false;
+        }
+        self.frame[len_byte] = data.len() as u8;
+        self.frame[payload_start..payload_end].copy_from_slice(data);
+        true
+    }
+}
+
 /// A repeating-group view: sequential fixed-length entries over the
 /// group's extent. Entries are accessed by index, bounds-checked.
 #[derive(Debug)]
@@ -303,6 +399,26 @@ mod tests {
         assert_eq!(g.entry(0), Some(&b"entry1"[..]));
         assert_eq!(g.entry(1), Some(&b"entry2"[..]));
         assert_eq!(g.entry(2), None, "index 2 is out of range");
+    }
+
+    #[test]
+    fn encode_decode_roundtrip() {
+        let mut frame = [0u8; 64];
+        let mut enc = SbeEncoder::new(&mut frame);
+        enc.write_header(12, 7, 1, 0);
+        enc.put_u16(8, 0xDEAD);
+        enc.put_u32(10, 0xBEEF_CAFE);
+        enc.put_u64(16, 0x0123_4567_89AB_CDEF);
+
+        let d = SbeDecoder::new(&frame);
+        let h = d.message_header().expect("header");
+        assert_eq!(h.block_length, 12);
+        assert_eq!(h.template_id, 7);
+        assert_eq!(h.schema_id, 1);
+        assert_eq!(h.version, 0);
+        assert_eq!(d.u16_at(8), Some(0xDEAD));
+        assert_eq!(d.u32_at(10), Some(0xBEEF_CAFE));
+        assert_eq!(d.u64_at(16), Some(0x0123_4567_89AB_CDEF));
     }
 
     #[test]
