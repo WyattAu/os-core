@@ -1,0 +1,15 @@
+[package]
+name = "omni-sbe"
+description = "Zero-copy SBE (Simple Binary Encoding) frame decoder for market-data ingestion — no alloc, no panics, no unsafe (pillar 208 CPU-fallback baseline)."
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+proptest = { workspace = true }
