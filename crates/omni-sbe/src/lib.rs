@@ -205,27 +205,26 @@ impl<'a> SbeEncoder<'a> {
         schema_id: u16,
         version: u16,
     ) {
-        let hdr = consts::HEADER_LEN;
-        if hdr < 8 || self.frame.len() < hdr {
-            return;
+        for (off, val) in [
+            (0, block_length),
+            (2, template_id),
+            (4, schema_id),
+            (6, version),
+        ] {
+            let _ = self.put_u16(off, val);
         }
-        self.frame[0..2].copy_from_slice(&block_length.to_le_bytes());
-        self.frame[2..4].copy_from_slice(&template_id.to_le_bytes());
-        self.frame[4..6].copy_from_slice(&schema_id.to_le_bytes());
-        self.frame[6..8].copy_from_slice(&version.to_le_bytes());
     }
 
     /// Writes a little-endian scalar of `N` bytes at `offset`.
     /// Returns `false` when the field extent runs past the frame.
     pub fn put_scalar<const N: usize>(&mut self, offset: usize, value: &[u8; N]) -> bool {
-        let end = match offset.checked_add(N) {
-            Some(e) => e,
-            None => return false,
-        };
-        if end > self.frame.len() {
+        let Some(end) = offset.checked_add(N) else {
             return false;
-        }
-        self.frame[offset..end].copy_from_slice(value);
+        };
+        let Some(slot) = self.frame.get_mut(offset..end) else {
+            return false;
+        };
+        slot.copy_from_slice(value);
         true
     }
 
@@ -252,28 +251,39 @@ impl<'a> SbeEncoder<'a> {
         block_length: u16,
         num_in_group: u16,
     ) -> bool {
-        if offset + consts::GROUP_HEADER_LEN > self.frame.len() {
+        let Some(end) = offset.checked_add(consts::GROUP_HEADER_LEN) else {
             return false;
-        }
-        self.frame[offset..offset + 2].copy_from_slice(&block_length.to_le_bytes());
-        self.frame[offset + 2..offset + 4].copy_from_slice(&num_in_group.to_le_bytes());
+        };
+        let Some(hdr) = self.frame.get_mut(offset..end) else {
+            return false;
+        };
+        let (bl, ng) = hdr.split_at_mut(2);
+        bl.copy_from_slice(&block_length.to_le_bytes());
+        ng.copy_from_slice(&num_in_group.to_le_bytes());
         true
     }
 
     /// Writes a varData field at `offset`: length prefix + payload.
-    /// Returns `false` when the prefix or payload would overrun.
+    /// Returns `false` when the payload exceeds the u8 length prefix or
+    /// the prefix/payload would overrun the frame.
     pub fn put_var_data(&mut self, offset: usize, data: &[u8]) -> bool {
-        let len_byte = offset;
-        let payload_start = offset + 1;
-        let payload_end = match payload_start.checked_add(data.len()) {
-            Some(e) => e,
-            None => return false,
-        };
-        if payload_end > self.frame.len() {
+        let Ok(len8) = u8::try_from(data.len()) else {
             return false;
+        };
+        let Some(payload_start) = offset.checked_add(1) else {
+            return false;
+        };
+        let Some(payload_end) = payload_start.checked_add(data.len()) else {
+            return false;
+        };
+        let Some(region) = self.frame.get_mut(offset..payload_end) else {
+            return false;
+        };
+        let (len_byte, payload) = region.split_at_mut(1);
+        if let Some(b) = len_byte.first_mut() {
+            *b = len8;
         }
-        self.frame[len_byte] = data.len() as u8;
-        self.frame[payload_start..payload_end].copy_from_slice(data);
+        payload.copy_from_slice(data);
         true
     }
 }
@@ -411,7 +421,11 @@ mod tests {
         enc.put_u64(16, 0x0123_4567_89AB_CDEF);
 
         let d = SbeDecoder::new(&frame);
-        let h = d.message_header().expect("header");
+        let h = d.message_header();
+        assert!(h.is_some(), "header must decode");
+        let Some(h) = h else {
+            return;
+        };
         assert_eq!(h.block_length, 12);
         assert_eq!(h.template_id, 7);
         assert_eq!(h.schema_id, 1);
@@ -444,5 +458,25 @@ mod tests {
         f.extend_from_slice(&[0u8; 12]);
         let d = SbeDecoder::new(&f);
         assert!(d.group_at(8).is_none(), "declared extent past the frame");
+    }
+
+    #[test]
+    fn put_var_data_rejects_over_u8_length() {
+        // SBE varData length is a u8: a 256-byte payload must be
+        // rejected, not truncated into a corrupt 0-length prefix.
+        let body_255 = [0xABu8; 255];
+        let mut wide = [0u8; 8 + 1 + 255];
+        let mut enc_wide = SbeEncoder::new(&mut wide);
+        assert!(
+            enc_wide.put_var_data(8, &body_255),
+            "255 fits the u8 prefix"
+        );
+        let d = SbeDecoder::new(&wide);
+        assert_eq!(d.var_data(8), Some(&body_255[..]), "255-byte round trip");
+
+        let body_256 = [0xCDu8; 256];
+        let mut f256 = [0u8; 8 + 1 + 256];
+        let mut enc256 = SbeEncoder::new(&mut f256);
+        assert!(!enc256.put_var_data(8, &body_256), "256 must be rejected");
     }
 }
