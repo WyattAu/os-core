@@ -269,7 +269,9 @@ mod tests {
         let mut f = frame_with(&body);
         let hdrlen = consts::HEADER_LEN;
         for (i, b) in 0x0102_0304_0506_0708u64.to_le_bytes().iter().enumerate() {
-            f[hdrlen + i] = *b;
+            if let Some(slot) = f.get_mut(hdrlen + i) {
+                *slot = *b;
+            }
         }
         let d = SbeDecoder::new(&f);
         assert_eq!(
@@ -293,9 +295,8 @@ mod tests {
             tail.copy_from_slice(&body);
         }
         let d = SbeDecoder::new(&f);
-        let g = match d.group_at(hdrlen) {
-            Some(g) => g,
-            None => std::process::abort(),
+        let Some(g) = d.group_at(hdrlen) else {
+            std::process::abort();
         };
         assert_eq!(g.count(), 2);
         assert_eq!(g.entry_block_length(), 6);

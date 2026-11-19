@@ -28,7 +28,9 @@ proptest! {
     ) {
         let f = [bl.to_le_bytes(), tid.to_le_bytes(), sid.to_le_bytes(), ver.to_le_bytes()].concat();
         let d = SbeDecoder::new(&f);
-        let h = d.message_header().expect("8-byte frame has a header");
+        let Some(h) = d.message_header() else {
+            std::process::abort();
+        };
         prop_assert_eq!(h.block_length, bl);
         prop_assert_eq!(h.template_id, tid);
         prop_assert_eq!(h.schema_id, sid);

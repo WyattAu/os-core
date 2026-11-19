@@ -20,3 +20,4 @@ proofs/.lake/
 kernels/omniosk-kernel/trace.log
 kernels/omniosk-kernel/tests/serial.log
 kernels/omniosk-kernel/tests/nvme.img
+kernels/omniosk-kernel/target/
