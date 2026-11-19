@@ -719,6 +719,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "omni-sbe"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+]
+
+[[package]]
 name = "omni-service"
 version = "0.1.0"
 dependencies = [

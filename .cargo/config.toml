@@ -1,2 +1,4 @@
-[build]
-target-dir = "/home/wyatt/.cache/cargo-target"
+# target-dir is NOT committed: CI runners cannot create /home/wyatt/.cache
+# (accessctl incident 2026-11-16). Local development exports
+# CARGO_TARGET_DIR="$HOME/.cache/cargo-target" in the shell (the fleet
+# rule); the repo default ./target applies when the variable is unset.
