@@ -1008,22 +1008,29 @@ extern "C" fn kernel_main() -> ! {
     // SAFETY: see above.
     unsafe { *sched = Some(fresh) };
 
-    let mut iters = 0usize;
+    // Tick-count-based window: ~400 ticks (~400 ms at the PIT's ~1 kHz)
+    // regardless of TCG speed — the iteration count varies inversely
+    // with the emulation speed, the tick count does not.
+    let deadline = TIMER_TICKS.load(core::sync::atomic::Ordering::Relaxed) + 400;
     let mut rotation_ok = false;
     let mut retire_ok = false;
-    while iters < 60_000_000 {
+    let mut sleeper_ok = false;
+    while TIMER_TICKS.load(core::sync::atomic::Ordering::Relaxed) < deadline {
         let runs = TASK_RUNS.load(core::sync::atomic::Ordering::Relaxed);
         let retire = RETIRE_RUNS.load(core::sync::atomic::Ordering::Relaxed);
+        let sleeper = SLEEPER_RUNS.load(core::sync::atomic::Ordering::Relaxed);
         if runs >= 5 {
             rotation_ok = true;
         }
         if retire >= 3 {
             retire_ok = true;
         }
-        if rotation_ok && retire_ok {
+        // All three witnesses must complete: the rotation, the
+        // retirement, AND the sleeper's 3rd dispatch (the spacing
+        // witness) — the loop never breaks before the slowest one.
+        if rotation_ok && retire_ok && sleeper >= 3 {
             break;
         }
-        iters += 1;
     }
     let s_dispatches = unsafe {
         (*sched).as_ref().map_or(0u32, |s| s.dispatches() as u32)
