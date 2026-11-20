@@ -255,21 +255,33 @@ the line-for-line form of the Rust u32 body; the bitwise/additive
 bridge below carries the wire theorems onto it. -/
 def wire_create_q_cdw10 (cqid qsize0 : Nat) : Nat := cqid ||| (qsize0 <<< 16)
 
-/-- Mirror of `SpscRing`'s slot index: `pos & (CAP - 1)`. -/
+/-- Mirror of `SpscRing`'s slot index: `pos & (CAP - 1)`. The
+def-form theorems below are the THEOREMS OF RECORD for the ring
+surface (ADR-0014 rung C): the arithmetic forms above are the engines
+that prove them, and the Rust oracles execute the def forms. -/
 def spsc_slot (pos cap : Nat) : Nat := pos &&& (cap - 1)
 
-/-- Mirror theorem: the def's output is a valid slot index. -/
-theorem spsc_slot_bounded_mirror (pos k : Nat) (hk : 0 < k) :
+/-- Theorem of record: the def's output is a valid slot index. -/
+theorem spsc_slot_bounded (pos k : Nat) (hk : 0 < k) :
     spsc_slot pos (2 ^ k) < 2 ^ k :=
   ring_mask_bounded (2 ^ k) k pos rfl hk
 
-/-- Mirror theorem: distinct in-window descriptors never collide on a
-slot (the FIFO-order guarantee, at the def). -/
-theorem spsc_slot_injective_mirror (head j1 j2 k : Nat)
+/-- Theorem of record: distinct in-window descriptors never collide on
+a slot (the FIFO-order guarantee, at the def). -/
+theorem spsc_slot_injective (head j1 j2 k : Nat)
     (h1 : j1 < 2 ^ k) (h2 : j2 < 2 ^ k)
     (heq : spsc_slot (head + j1) (2 ^ k) = spsc_slot (head + j2) (2 ^ k)) :
     j1 = j2 :=
   ring_mask_injective head j1 j2 k h1 h2 heq
+
+/-- Theorem of record: two DISTINCT in-flight descriptors (both inside
+the tail window of an in-flight count no larger than the capacity)
+occupy different slots. -/
+theorem spsc_inflight_distinct (tail j1 j2 k inflight : Nat)
+    (h1 : j1 < inflight) (h2 : j2 < inflight) (hne : j1 ≠ j2)
+    (hwindow : inflight ≤ 2 ^ k) :
+    spsc_slot (tail + j1) (2 ^ k) ≠ spsc_slot (tail + j2) (2 ^ k) :=
+  ring_inflight_distinct tail j1 j2 k inflight h1 h2 hne hwindow
 
 /-- Mirror of `PageAlloc`'s page address: `base + idx * PAGE_SIZE`. -/
 def heap_page (base idx : Nat) : Nat := base + idx * 4096
@@ -365,8 +377,9 @@ example : ¬cap_contains 0 8 8 := by decide
 #print axioms wire_cqe_phase_mirror
 #print axioms wire_cdw10_cqid_mirror
 #print axioms wire_cdw10_qsize_mirror
-#print axioms spsc_slot_bounded_mirror
-#print axioms spsc_slot_injective_mirror
+#print axioms spsc_slot_bounded
+#print axioms spsc_slot_injective
 #print axioms heap_page_aligned_mirror
+#print axioms spsc_inflight_distinct
 #print axioms heap_page_range_mirror
 #print axioms cap_contains_mirror

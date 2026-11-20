@@ -20,8 +20,9 @@ const CAP: usize = 8;
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(512))]
 
-    /// Executes `ring_inflight_distinct` + `ring_window_injective`
-    /// (`proofs/Proofs.lean`): an arbitrary interleaving of pushes and
+    /// Executes `spsc_inflight_distinct` + the window injectivity
+    /// engine (`proofs/Proofs.lean`, theorems of record): an arbitrary
+    /// interleaving of pushes and
     /// pops must refine the FIFO model exactly. Distinct in-flight
     /// descriptors (both inside the `len() <= CAP` window) never alias
     /// a slot, so pop order equals push order across any number of
@@ -63,7 +64,8 @@ proptest! {
     }
 }
 
-/// Executes `ring_mask_injective` at the wrap seam: a full window
+/// Executes `spsc_slot_injective` (the def form of
+/// `ring_mask_injective`) at the wrap seam: a full window
 /// (in-flight == CAP) slid past the array boundary — push CAP, drain W,
 /// push W fresh descriptors (their masked indices wrap), drain all —
 /// comes back in exact push order. Equal masked indices for distinct
@@ -95,7 +97,7 @@ fn full_window_survives_wrap_seam() {
     assert_eq!(ring.try_pop(), None, "empty at the end");
 }
 
-/// Executes `ring_inflight_distinct` at the payload layer: distinct
+/// Executes `spsc_inflight_distinct` at the payload layer: distinct
 /// descriptors carry independent payloads and `take` is one-shot, so no
 /// payload is delivered twice and nothing leaks between descriptors.
 #[test]

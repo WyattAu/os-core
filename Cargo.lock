@@ -710,6 +710,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "omni-io"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "omni-ring"
 version = "0.2.0"
 dependencies = [

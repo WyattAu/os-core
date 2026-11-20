@@ -1,0 +1,15 @@
+[package]
+name = "omni-io"
+description = "Linux io_uring seam over raw syscalls — the K2 doorbell I/O surface (REQ-OS-004 follow-up)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+libc = { workspace = true }
