@@ -699,6 +699,19 @@ fn task_blockcheck(ctx: &mut TaskCtx) -> TaskFlow {
     write_hex32(&mut dbg, inner_addr as u32);
     dbg.write_str(" lbas_now=");
     write_hex32(&mut dbg, lbas_now as u32);
+    let cur_now = unsafe {
+        core::ptr::addr_of!(NVME_SESSION).as_ref().map_or((0, 0, 0), |opt| {
+            opt.as_ref().map_or((0, 0, 0), |s| {
+                (s.cqe_idx, s.cqe_phase, s.iosq_tail)
+            })
+        })
+    };
+    dbg.write_str(" idx=");
+    write_hex32(&mut dbg, cur_now.0 as u32);
+    dbg.write_str(" ph=");
+    write_hex32(&mut dbg, cur_now.1 as u32);
+    dbg.write_str(" tail=");
+    write_hex32(&mut dbg, cur_now.2 as u32);
     dbg.write_str("\n");
     let Some(s) = (unsafe { (*session).as_mut() }) else {
         BLOCKCHECK_FAIL.fetch_add(1, Ordering::Relaxed);
@@ -709,6 +722,27 @@ fn task_blockcheck(ctx: &mut TaskCtx) -> TaskFlow {
     let magic_ok = read.is_ok() && buf[..nvme::MAGIC.len()] == *nvme::MAGIC;
     let ok = read.is_ok() && magic_ok;
     if !ok {
+        // Fail-path probe: the raw CQE dword for the slot the session
+        // poll was waiting on. Phase bit = DW3 bit 16, SF = DW3[30:17],
+        // CID = DW3[15:0]. Distinguishes "completion never landed"
+        // (dw3 stale), "phase convention mismatch" (P=0 here), and
+        // "completed with status error" (SF != 0, P=1).
+        let dw3 = nvme::mmio32(s.iocq, 3 * 16 + 12);
+        dbg.write_str("bc: raw dw3=");
+        write_hex32(&mut dbg, dw3);
+        dbg.write_str(" p=");
+        dbg.write_byte(b'0' + omni_block::wire::cqe_phase_of(dw3) as u8);
+        dbg.write_str(" sf=");
+        write_hex32(&mut dbg, (dw3 >> 17) & 0x3FFF);
+        dbg.write_str(" cid=");
+        write_hex32(&mut dbg, omni_block::wire::cqe_cid(dw3) as u32);
+        dbg.write_str(" post idx=");
+        write_hex32(&mut dbg, s.cqe_idx as u32);
+        dbg.write_str(" ph=");
+        write_hex32(&mut dbg, s.cqe_phase as u32);
+        dbg.write_str(" tail=");
+        write_hex32(&mut dbg, s.iosq_tail as u32);
+        dbg.write_str("\n");
         BLOCKCHECK_FAIL.fetch_add(1, Ordering::Relaxed);
         return TaskFlow::Done;
     }
@@ -970,6 +1004,21 @@ extern "C" fn kernel_main() -> ! {
             // SAFETY: single-threaded boot context; the static is the
             // sole owner of the session past this point.
             unsafe { core::ptr::addr_of_mut!(NVME_SESSION).write(Some(session)) };
+            // Handoff probe: the static's cursor state must be the
+            // smoke's (idx=3, ph=1, tail=3). Anything else means the
+            // constructor or an earlier write is wrong.
+            let hs = unsafe {
+                core::ptr::addr_of!(NVME_SESSION).as_ref().map_or((0, 0, 0), |opt| {
+                    opt.as_ref().map_or((0, 0, 0), |s| (s.cqe_idx, s.cqe_phase, s.iosq_tail))
+                })
+            };
+            uart.write_str("hand: idx=");
+            write_hex32(&mut uart, hs.0 as u32);
+            uart.write_str(" ph=");
+            write_hex32(&mut uart, hs.1 as u32);
+            uart.write_str(" tail=");
+            write_hex32(&mut uart, hs.2 as u32);
+            uart.write_str("\n");
             true
         } else {
             false
@@ -1015,20 +1064,31 @@ extern "C" fn kernel_main() -> ! {
     let mut rotation_ok = false;
     let mut retire_ok = false;
     let mut sleeper_ok = false;
+    // The blockcheck task retires after 3 OK reads or on the first
+    // failure — the window must wait for its contract to close too
+    // (restored: the 53fa571 cleanup dropped it and the window then
+    // closed after the task's first dispatch, stranding it mid-run).
+    let mut blockcheck_done = false;
     while TIMER_TICKS.load(core::sync::atomic::Ordering::Relaxed) < deadline {
         let runs = TASK_RUNS.load(core::sync::atomic::Ordering::Relaxed);
         let retire = RETIRE_RUNS.load(core::sync::atomic::Ordering::Relaxed);
         let sleeper = SLEEPER_RUNS.load(core::sync::atomic::Ordering::Relaxed);
+        let bc = BLOCKCHECK_OK.load(core::sync::atomic::Ordering::Relaxed)
+            + BLOCKCHECK_FAIL.load(core::sync::atomic::Ordering::Relaxed);
         if runs >= 5 {
             rotation_ok = true;
         }
         if retire >= 3 {
             retire_ok = true;
         }
-        // All three witnesses must complete: the rotation, the
-        // retirement, AND the sleeper's 3rd dispatch (the spacing
-        // witness) — the loop never breaks before the slowest one.
-        if rotation_ok && retire_ok && sleeper >= 3 {
+        if bc >= 3 {
+            blockcheck_done = true;
+        }
+        // All four witnesses must complete: the rotation, the
+        // retirement, the sleeper's 3rd dispatch (the spacing
+        // witness), AND the blockcheck's retirement — the loop never
+        // breaks before the slowest one.
+        if rotation_ok && retire_ok && sleeper >= 3 && blockcheck_done {
             break;
         }
     }
@@ -1046,7 +1106,14 @@ extern "C" fn kernel_main() -> ! {
     let sleep_ok = s_runs >= 3
         && s_last >= s_first
         && (s_last - s_first) >= 5 * (s_runs - 2);
-    if rotation_ok && retire_ok && live_ok && sleep_ok {
+    // The blockcheck contract is a required witness: 3 trait-object
+    // reads through the handed-off NVMe session, zero failures. A
+    // session-loss regression (the historical no-session-at-dispatch
+    // bug) now fails TASK PASS instead of passing silently.
+    let bc_ok = BLOCKCHECK_OK.load(core::sync::atomic::Ordering::Relaxed);
+    let bc_fail = BLOCKCHECK_FAIL.load(core::sync::atomic::Ordering::Relaxed);
+    let blockcheck_ok = bc_ok >= 3 && bc_fail == 0;
+    if rotation_ok && retire_ok && live_ok && sleep_ok && blockcheck_ok {
         uart.write_str("TASK PASS\n");
     } else {
         uart.write_str("TASK FAIL rot=");
@@ -1057,9 +1124,10 @@ extern "C" fn kernel_main() -> ! {
         uart.write_byte(b'0' + live_ok as u8);
         uart.write_str(" slp=");
         uart.write_byte(b'0' + sleep_ok as u8);
+        uart.write_str(" bc=");
+        uart.write_byte(b'0' + blockcheck_ok as u8);
         uart.write_str(" bc_ok=");
-        write_hex32(&mut uart,
-            BLOCKCHECK_OK.load(core::sync::atomic::Ordering::Relaxed) as u32);
+        write_hex32(&mut uart, bc_ok as u32);
         uart.write_str(" bc_fail=");
         write_hex32(&mut uart,
             BLOCKCHECK_FAIL.load(core::sync::atomic::Ordering::Relaxed) as u32);

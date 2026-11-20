@@ -42,7 +42,7 @@ pub static LAST_NSZE: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 
 #[inline]
-fn mmio32(base: usize, off: usize) -> u32 {
+pub(crate) fn mmio32(base: usize, off: usize) -> u32 {
     unsafe { core::ptr::read_volatile((base + off) as *const u32) }
 }
 
@@ -88,14 +88,23 @@ fn submit(bar: usize, sq: usize, tail: usize, sq_db_off: usize, entry: &[u8; 64]
 
 /// Polls the CQE at `idx` until its phase bit matches `phase` (bounded);
 /// returns Some(dw3) on completion, None on timeout. Rings the CQ head
-/// doorbell (`cq_hd_off`) for the consumed entry.
+/// doorbell (`cq_hd_off`) for the consumed entry — wrapped by `qsize`,
+/// the RING'S OWN size (admin 32, I/O 64): wrapping against the wrong
+/// queue's size rewinds the head and corrupts the device's accounting.
 ///
 /// CQE DW3 layout (per Linux nvme_completion / QEMU NvmeCqe — verified
 /// against QEMU 11.1.3 hw/nvme): DW3[15:0] = CID, DW3[31:16] = status
 /// u16 with SF<<1 | P. The phase bit is therefore bit 16 of DW3, NOT
 /// bit 0. Reading bit 0 reads the CID's LSB: odd CIDs (identify, CID=1)
 /// appear to complete, even CIDs (create-cq, CID=2) never do.
-fn wait_cqe(bar: usize, cq: usize, idx: usize, phase: u32, cq_hd_off: usize) -> Option<u32> {
+fn wait_cqe(
+    bar: usize,
+    cq: usize,
+    idx: usize,
+    phase: u32,
+    cq_hd_off: usize,
+    qsize: usize,
+) -> Option<u32> {
     let mut spins = 0usize;
     let dw3 = loop {
         let v = mmio32(cq, idx * 16 + 12);
@@ -107,7 +116,7 @@ fn wait_cqe(bar: usize, cq: usize, idx: usize, phase: u32, cq_hd_off: usize) -> 
             return None;
         }
     };
-    mmio32w(bar, cq_hd_off, ((idx + 1) % QSIZE) as u32);
+    mmio32w(bar, cq_hd_off, ((idx + 1) % qsize) as u32);
     Some(dw3)
 }
 
@@ -138,13 +147,13 @@ pub struct NvmeSession {
     pub iosq: usize,
     pub iocq: usize,
     pub readb: usize,
-    stride: u32,
+    pub(crate) stride: u32,
     /// Next I/O submission-queue slot.
-    iosq_tail: usize,
+    pub(crate) iosq_tail: usize,
     /// Next I/O completion-queue entry to poll.
-    cqe_idx: usize,
+    pub(crate) cqe_idx: usize,
     /// Completion phase bit for `cqe_idx`.
-    cqe_phase: u32,
+    pub(crate) cqe_phase: u32,
 }
 
 /// Submits an I/O read of `lba` into the session's read page and waits
@@ -160,10 +169,10 @@ fn io_read_lba(s: &mut NvmeSession, lba: u64) -> bool {
     let tail = s.iosq_tail;
     submit(s.bar, s.iosq, tail, sq_db_off(1, s.stride), &sqe);
     s.iosq_tail = (tail + 1) % IO_QSIZE;
-    let ok = wait_cqe(s.bar, s.iocq, s.cqe_idx, s.cqe_phase, cq_hd_off(1, s.stride))
+    let ok = wait_cqe(s.bar, s.iocq, s.cqe_idx, s.cqe_phase, cq_hd_off(1, s.stride), IO_QSIZE)
         .is_some();
     s.cqe_idx += 1;
-    if s.cqe_idx >= QSIZE {
+    if s.cqe_idx >= IO_QSIZE {
         s.cqe_idx = 0;
         s.cqe_phase = s.cqe_phase.wrapping_add(1) & 1;
     }
@@ -183,10 +192,10 @@ fn io_write_lba(s: &mut NvmeSession, lba: u64) -> bool {
     let tail = s.iosq_tail;
     submit(s.bar, s.iosq, tail, sq_db_off(1, s.stride), &sqe);
     s.iosq_tail = (tail + 1) % IO_QSIZE;
-    let ok = wait_cqe(s.bar, s.iocq, s.cqe_idx, s.cqe_phase, cq_hd_off(1, s.stride))
+    let ok = wait_cqe(s.bar, s.iocq, s.cqe_idx, s.cqe_phase, cq_hd_off(1, s.stride), IO_QSIZE)
         .is_some();
     s.cqe_idx += 1;
-    if s.cqe_idx >= QSIZE {
+    if s.cqe_idx >= IO_QSIZE {
         s.cqe_idx = 0;
         s.cqe_phase = s.cqe_phase.wrapping_add(1) & 1;
     }
@@ -301,7 +310,7 @@ pub fn smoke(p: &NvmePages) -> Option<NvmeSession> {
     sqe[24..32].copy_from_slice(&(ident as u64).to_le_bytes()); // PRP1
     sqe[40..44].copy_from_slice(&1u32.to_le_bytes()); // CDW10: CNS = 1
     submit(bar, asq, 0, sq_db_off(0, stride), &sqe);
-    let dw3 = match wait_cqe(bar, acq, 0, 1, cq0_hd) {
+    let dw3 = match wait_cqe(bar, acq, 0, 1, cq0_hd, ADMIN_QSIZE as usize) {
         Some(v) => v,
         None => {
             uart.write_str("NVME: identify CQE timeout\n");
@@ -340,7 +349,7 @@ pub fn smoke(p: &NvmePages) -> Option<NvmeSession> {
     sqe[24..32].copy_from_slice(&(ident as u64).to_le_bytes()); // PRP1
     sqe[40..44].copy_from_slice(&0u32.to_le_bytes()); // CDW10: CNS = 0
     submit(bar, asq, 1, sq_db_off(0, stride), &sqe);
-    let dw3 = match wait_cqe(bar, acq, 1, 1, cq0_hd) {
+    let dw3 = match wait_cqe(bar, acq, 1, 1, cq0_hd, ADMIN_QSIZE as usize) {
         Some(v) => v,
         None => {
             uart.write_str("NVME: identify-ns CQE timeout\n");
@@ -375,7 +384,7 @@ pub fn smoke(p: &NvmePages) -> Option<NvmeSession> {
     sqe[44..46].copy_from_slice(&3u16.to_le_bytes()); // flags: PC + IEN
     sqe[46..48].copy_from_slice(&0u16.to_le_bytes()); // IRQ vector = 0
     submit(bar, asq, 2, sq_db_off(0, stride), &sqe);
-    let dw3 = match wait_cqe(bar, acq, 2, 1, cq0_hd) {
+    let dw3 = match wait_cqe(bar, acq, 2, 1, cq0_hd, ADMIN_QSIZE as usize) {
         Some(v) => v,
         None => {
             uart.write_str("NVME: IOCQ create timeout\n");
@@ -411,7 +420,7 @@ pub fn smoke(p: &NvmePages) -> Option<NvmeSession> {
     sqe[44..46].copy_from_slice(&1u16.to_le_bytes()); // SQ_FLAGS: PC
     sqe[46..48].copy_from_slice(&1u16.to_le_bytes()); // CQID = 1
     submit(bar, asq, 3, sq_db_off(0, stride), &sqe);
-    let dw3 = match wait_cqe(bar, acq, 3, 1, cq0_hd) {
+    let dw3 = match wait_cqe(bar, acq, 3, 1, cq0_hd, ADMIN_QSIZE as usize) {
         Some(v) => v,
         None => {
             uart.write_str("NVME: IOSQ create timeout\n");
@@ -434,7 +443,7 @@ pub fn smoke(p: &NvmePages) -> Option<NvmeSession> {
     sqe[40..44].copy_from_slice(&0u32.to_le_bytes()); // CDW10: SLBA = 0
     sqe[48..52].copy_from_slice(&0u32.to_le_bytes()); // CDW12: NLB-1 = 0
     submit(bar, iosq, 0, sq_db_off(1, stride), &sqe);
-    let dw3 = match wait_cqe(bar, iocq, 0, 1, cq_hd_off(1, stride)) {
+    let dw3 = match wait_cqe(bar, iocq, 0, 1, cq_hd_off(1, stride), IO_QSIZE) {
         Some(v) => v,
         None => {
             uart.write_str("NVME: read timeout\n");
@@ -471,7 +480,7 @@ pub fn smoke(p: &NvmePages) -> Option<NvmeSession> {
     sqe[40..44].copy_from_slice(&1u32.to_le_bytes()); // CDW10: SLBA lo = 1
     sqe[48..52].copy_from_slice(&0u32.to_le_bytes()); // CDW12: NLB-1 = 0
     submit(bar, iosq, 1, sq_db_off(1, stride), &sqe);
-    let dw3 = match wait_cqe(bar, iocq, 1, 1, cq_hd_off(1, stride)) {
+    let dw3 = match wait_cqe(bar, iocq, 1, 1, cq_hd_off(1, stride), IO_QSIZE) {
         Some(v) => v,
         None => {
             uart.write_str("NVME: write timeout\n");
@@ -497,7 +506,7 @@ pub fn smoke(p: &NvmePages) -> Option<NvmeSession> {
     sqe[40..44].copy_from_slice(&1u32.to_le_bytes()); // CDW10: SLBA lo = 1
     sqe[48..52].copy_from_slice(&0u32.to_le_bytes()); // CDW12: NLB-1 = 0
     submit(bar, iosq, 2, sq_db_off(1, stride), &sqe);
-    let dw3 = match wait_cqe(bar, iocq, 2, 1, cq_hd_off(1, stride)) {
+    let dw3 = match wait_cqe(bar, iocq, 2, 1, cq_hd_off(1, stride), IO_QSIZE) {
         Some(v) => v,
         None => {
             uart.write_str("NVME: write-verify read timeout\n");

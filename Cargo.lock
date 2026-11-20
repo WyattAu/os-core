@@ -679,6 +679,7 @@ dependencies = [
 name = "omni-cap"
 version = "0.1.0"
 dependencies = [
+ "proptest",
  "siphasher",
 ]
 
