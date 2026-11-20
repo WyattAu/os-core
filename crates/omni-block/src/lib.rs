@@ -191,6 +191,49 @@ impl<const SECTORS: usize> Default for BlockRam<SECTORS> {
     }
 }
 
+/// Pure `NVMe` wire-layout helpers (REQ-OS-006): the byte-order
+/// contracts machine-checked in `proofs/Proofs.lean` live here as
+/// functions the kernel consumes, so the wire arithmetic is exercised
+/// by the refinement oracle (`tests/refinement.rs`, ADR-0014 pattern)
+/// instead of being inlined untested in ISR code.
+pub mod wire {
+    /// CQE DW3 phase bit. DW3[31:16] is the status half
+    /// (`SF << 1 | P`), so the phase is DW3 bit 16 — NOT bit 0, which
+    /// is the CID's LSB. Reading bit 0 is the exact bug the theorem
+    /// `nvme_cqe_phase_is_high_half_lsb` documents (commit 66e7d4b:
+    /// odd-CID commands appeared to complete, even-CID never did).
+    #[must_use]
+    pub const fn cqe_phase_of(dw3: u32) -> u32 {
+        (dw3 >> 16) & 1
+    }
+
+    /// CQE DW3 status half (DW3[31:16], bytes 14-15 LE).
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)] // exact: the masked top half IS a u16
+    pub const fn cqe_status(dw3: u32) -> u16 {
+        (dw3 >> 16) as u16
+    }
+
+    /// CQE DW3 command id half (DW3[15:0], bytes 12-13 LE).
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)] // exact: the masked low half IS a u16
+    pub const fn cqe_cid(dw3: u32) -> u16 {
+        dw3 as u16
+    }
+
+    /// `CreateCq` / `CreateSq` CDW10 overlay: `ID[15:0] | QSIZE[31:16]`,
+    /// where QSIZE is the *0-based* entry count (quantity - 1) per the
+    /// QEMU `NvmeCreateCq` overlay — theorems
+    /// `nvme_create_cq_cqid_extraction` and
+    /// `nvme_create_cq_qsize_extraction`. Writing the 1-based count
+    /// across the whole word was the stale `cqid=3, qsize=0` trace.
+    #[must_use]
+    #[allow(clippy::cast_lossless)] // From<u16> is not const-callable on stable
+    pub const fn create_q_cdw10(cqid: u16, qsize0: u16) -> u32 {
+        (cqid as u32) | ((qsize0 as u32) << 16)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     // Tests link the harness's std; the lib itself stays no_std.

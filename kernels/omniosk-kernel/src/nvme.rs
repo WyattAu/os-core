@@ -99,7 +99,7 @@ fn wait_cqe(bar: usize, cq: usize, idx: usize, phase: u32, cq_hd_off: usize) -> 
     let mut spins = 0usize;
     let dw3 = loop {
         let v = mmio32(cq, idx * 16 + 12);
-        if (v >> 16 & 1) == phase {
+        if wire::cqe_phase_of(v) == phase {
             break v;
         }
         spins += 1;
@@ -193,7 +193,7 @@ fn io_write_lba(s: &mut NvmeSession, lba: u64) -> bool {
     ok
 }
 
-use omni_block::{BlockDevice, BlockError};
+use omni_block::{wire, BlockDevice, BlockError};
 
 /// The `omni-block` contract over the NVMe I/O queues (REQ layer).
 impl BlockDevice for NvmeSession {
@@ -370,8 +370,8 @@ pub fn smoke(p: &NvmePages) -> Option<NvmeSession> {
     sqe[0] = 0x05; // Create IOCQ
     sqe[2..4].copy_from_slice(&2u16.to_le_bytes()); // CID 2
     sqe[24..32].copy_from_slice(&(iocq as u64).to_le_bytes()); // PRP1
-    sqe[40..42].copy_from_slice(&1u16.to_le_bytes()); // CQID = 1
-    sqe[42..44].copy_from_slice(&((IO_QSIZE as u16) - 1).to_le_bytes()); // QSIZE (0-based)
+    let cdw10 = wire::create_q_cdw10(1, (IO_QSIZE as u16) - 1);
+    sqe[40..44].copy_from_slice(&cdw10.to_le_bytes()); // CQID[15:0] | QSIZE0[31:16]
     sqe[44..46].copy_from_slice(&3u16.to_le_bytes()); // flags: PC + IEN
     sqe[46..48].copy_from_slice(&0u16.to_le_bytes()); // IRQ vector = 0
     submit(bar, asq, 2, sq_db_off(0, stride), &sqe);
@@ -406,8 +406,8 @@ pub fn smoke(p: &NvmePages) -> Option<NvmeSession> {
     sqe[0] = 0x01; // Create IOSQ
     sqe[2..4].copy_from_slice(&3u16.to_le_bytes()); // CID 3
     sqe[24..32].copy_from_slice(&(iosq as u64).to_le_bytes()); // PRP1
-    sqe[40..42].copy_from_slice(&1u16.to_le_bytes()); // SQID = 1
-    sqe[42..44].copy_from_slice(&((IO_QSIZE as u16) - 1).to_le_bytes()); // QSIZE (0-based)
+    let cdw10 = wire::create_q_cdw10(1, (IO_QSIZE as u16) - 1);
+    sqe[40..44].copy_from_slice(&cdw10.to_le_bytes()); // SQID[15:0] | QSIZE0[31:16]
     sqe[44..46].copy_from_slice(&1u16.to_le_bytes()); // SQ_FLAGS: PC
     sqe[46..48].copy_from_slice(&1u16.to_le_bytes()); // CQID = 1
     submit(bar, asq, 3, sq_db_off(0, stride), &sqe);

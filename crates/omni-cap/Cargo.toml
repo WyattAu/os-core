@@ -13,3 +13,6 @@ workspace = true
 
 [dependencies]
 siphasher = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
