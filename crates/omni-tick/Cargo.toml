@@ -1,0 +1,12 @@
+[package]
+name = "omni-tick"
+description = "Fixed-width tick record + append-only segment store — the HFT data plane's database first design (ADR-0017)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true

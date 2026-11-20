@@ -53,3 +53,12 @@ our abstraction.
 - **Risk**: single-submitter v0.1 is not multi-core-safe yet; the
   multi-submitter tranche must land before any actor claims it (K2's
   kernel-side consumption stays in-kernel until then).
+
+**Update 2026-11-20 (tranche 2 landed):** SQPOLL (`Ring::open_sqpoll`,
+kernel-thread submission, enter-with-zero to_submit) and registered
+buffers (`register_buffers` + `READ_FIXED`/`WRITE_FIXED` with the
+table's addresses stamped into `addr` — the EFAULT lesson: some kernel
+paths require the address even for fixed ops) shipped with host smokes
+on the real io_uring. The A53 hardware session re-validates the SQPOLL
+batch numbers on the `5.10` kernel — the pending REQ-OS-004 item. The
+data plane this feeds is ADR-0017 (omni-md server + omni-tick store).

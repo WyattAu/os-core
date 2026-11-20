@@ -752,6 +752,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "omni-tick"
+version = "0.1.0"
+
+[[package]]
 name = "omniosk"
 version = "0.1.0"
 

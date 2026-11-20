@@ -150,3 +150,94 @@ impl<T> ExpectClean for Option<T> {
         }
     }
 }
+
+#[test]
+fn sqpoll_nop_drains() {
+    let opened = Ring::open_sqpoll(8, 1000);
+    let ring = match opened {
+        Ok(r) => r,
+        Err(e) => {
+            let known = [libc::ENOSYS, libc::EPERM, libc::EACCES, libc::EINVAL];
+            assert!(
+                known.contains(&e.raw_os_error().unwrap_or(0)),
+                "unexpected SQPOLL setup error: {e}"
+            );
+            eprintln!("skip: SQPOLL unavailable on this host ({e})");
+            return;
+        }
+    };
+    let mut ring = ring;
+    for i in 0..8u64 {
+        ring.prep_nop(i * 0x10);
+    }
+    let submitted = must(ring.submit_and_wait(8), "sqpoll enter");
+    assert_eq!(submitted, 0, "SQPOLL rings never report app-side submits");
+    let cqes = ring.completions();
+    assert_eq!(cqes.len(), 8, "kernel thread completed all 8");
+    for (i, cqe) in cqes.iter().enumerate() {
+        assert_eq!(cqe.user_data, (i as u64) * 0x10, "tag echoed");
+        assert_eq!(cqe.result, 0);
+    }
+}
+
+#[test]
+fn fixed_buffers_roundtrip() {
+    let Some(mut ring) = ring_or_skip() else {
+        return;
+    };
+    let path = std::env::temp_dir().join(format!("omni-io-fix-{}.bin", std::process::id()));
+    let seeded = std::fs::write(&path, b"OMNIOSK-FIXED-OK");
+    assert!(seeded.is_ok(), "seed: {:?}", seeded.err());
+    let opened = OpenOptions::new().read(true).write(true).open(&path);
+    assert!(opened.is_ok(), "open: {:?}", opened.as_ref().err());
+    let f = opened.unwrap_or_else(|_| std::process::abort());
+    let fd = f.as_raw_fd();
+
+    let mut bufs = [[0u8; 16]; 2];
+    let registered = ring.register_buffers(&mut bufs);
+    assert!(
+        registered.is_ok(),
+        "register_buffers: {:?}",
+        registered.err()
+    );
+
+    // READ_FIXED into registered slot 0.
+    ring.prep_read_fixed(0x1, fd, 0, 16, 0);
+    let submitted = must(ring.submit_and_wait(1), "read_fixed enter");
+    assert_eq!(submitted, 1);
+    let read_cqes = ring.completions();
+    assert_eq!(read_cqes.len(), 1);
+    assert_eq!(read_cqes.first().expect_clean("one").result, 16);
+    assert_eq!(&bufs[0], b"OMNIOSK-FIXED-OK", "fixed read bytes");
+
+    // WRITE_FIXED from registered slot 1, after truncate.
+    let truncated = f.set_len(0);
+    assert!(truncated.is_ok(), "truncate: {:?}", truncated.err());
+    let payload = b"FIXED-PASS-OK!!!";
+    bufs[1] = *payload;
+    ring.prep_write_fixed(0x2, fd, 1, 16, 0);
+    let submitted = must(ring.submit_and_wait(1), "write_fixed enter");
+    assert_eq!(submitted, 1);
+    // The kernel consumed the pinned buffer without scribbling it.
+    assert_eq!(bufs[1], *payload, "registered buffer preserved");
+    let write_cqes = ring.completions();
+    assert_eq!(write_cqes.len(), 1);
+    assert_eq!(write_cqes.first().expect_clean("one").result, 16);
+    drop(f);
+    let check = std::fs::read(&path);
+    assert!(check.is_ok(), "re-read: {:?}", check.err());
+    assert_eq!(check.unwrap_or_default(), b"FIXED-PASS-OK!!!");
+    let removed = std::fs::remove_file(&path);
+    assert!(removed.is_ok(), "cleanup: {:?}", removed.err());
+}
+
+#[test]
+fn unregistered_fixed_index_rejected() {
+    let Some(mut ring) = ring_or_skip() else {
+        return;
+    };
+    let tail_before = 0u32;
+    let queued = ring.prep_read_fixed(0x1, -1, 0, 16, 0);
+    assert!(!queued, "buf_index 0 with no registered table is rejected");
+    assert_eq!(tail_before, 0);
+}

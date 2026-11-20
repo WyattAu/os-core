@@ -47,6 +47,8 @@ const IORING_OFF_SQES: libc::off_t = 0x1000_0000;
 
 /// `io_uring_enter` flag: also reap completions.
 const IORING_ENTER_GETEVENTS: libc::c_uint = 1;
+/// `io_uring_setup` flag: a kernel thread submits from the SQ.
+const IORING_SETUP_SQPOLL: u32 = 1 << 1;
 
 /// Completion-queue entry: 16 bytes, `user_data | res | flags`.
 const CQE_SIZE: usize = 16;
@@ -108,6 +110,11 @@ impl Params {
     }
 }
 
+/// usize → u16 for values the API bounds at or below the table size.
+fn cu16(v: usize) -> u16 {
+    u16::try_from(v).unwrap_or_default()
+}
+
 /// One completed operation: the caller's tag and the result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Cqe {
@@ -135,6 +142,13 @@ pub struct Ring {
     cq_mask: u32,
     /// SQEs prepared but not yet submitted.
     pending: u32,
+    /// Registered-buffer table size (0 = none registered).
+    buf_count: usize,
+    /// Registered buffer base addresses (liburing also stamps `addr`
+    /// on fixed ops; some kernel paths require it).
+    buf_addrs: Vec<u64>,
+    /// The ring is SQPOLL: a kernel thread submits; `enter` only reaps.
+    sqpoll: bool,
     /// The ring tail (next SQE slot); the source of truth is this
     /// local, mirrored into the shared page at submit.
     tail: u32,
@@ -150,6 +164,27 @@ impl Ring {
     /// `ENOSYS` (kernel without `io_uring`) and `EPERM` (seccomp'd);
     /// `InvalidInput` for a bad `entries`.
     pub fn open(entries: usize) -> io::Result<Self> {
+        Self::open_with(entries, |_| {})
+    }
+
+    /// Opens a SQPOLL ring: a kernel thread submits from the SQ on its
+    /// own (sleeping `idle_ms` between passes), so the hot path never
+    /// traps into the syscall at all — the A53's 5,129 ns/op batch
+    /// mode. Needs registered buffers on 5.10-adjacent kernels;
+    /// unprivileged since 5.13. Failures are host policy (`EPERM`,
+    /// `EINVAL`) — callers skip, not panic.
+    ///
+    /// # Errors
+    ///
+    /// [`io::Error`] from `io_uring_setup` verbatim.
+    pub fn open_sqpoll(entries: usize, idle_ms: u32) -> io::Result<Self> {
+        Self::open_with(entries, |p| {
+            p.flags = IORING_SETUP_SQPOLL;
+            p.sq_thread_idle = idle_ms;
+        })
+    }
+
+    fn open_with(entries: usize, configure: impl FnOnce(&mut Params)) -> io::Result<Self> {
         if !entries.is_power_of_two() || entries > 4096 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -157,6 +192,7 @@ impl Ring {
             ));
         }
         let mut params = Params::zeroed();
+        configure(&mut params);
         // SAFETY: `params` is a valid, zeroed repr(C) `io_uring`_params;
         // the kernel writes its view into it. On error the raw syscall
         // returns -errno, mapped to io::Error below.
@@ -236,6 +272,9 @@ impl Ring {
             cq_mask: params.cq_entries - 1,
             pending: 0,
             tail: 0,
+            buf_count: 0,
+            buf_addrs: Vec::new(),
+            sqpoll: params.flags & IORING_SETUP_SQPOLL != 0,
         };
         // Identity mapping: ring position i carries SQE i. The masked
         // indexing is the Lean-proven algebra (`spsc_slot_bounded`):
@@ -331,6 +370,131 @@ impl Ring {
         self.pending += 1;
     }
 
+    /// Registers `bufs` with the kernel (`IORING_REGISTER_BUFFERS`):
+    /// the fixed opcodes then address buffers by index, eliding the
+    /// per-op pin — the HFT discipline for hot re-submission of the
+    /// same pool. `bufs` must outlive the ring (the kernel pins the
+    /// pages; the registered table dies with the fd at Drop).
+    ///
+    /// # Errors
+    ///
+    /// [`io::Error`] from `io_uring_register` verbatim; `InvalidInput`
+    /// for an empty slice.
+    pub fn register_buffers<const N: usize>(&mut self, bufs: &mut [[u8; N]]) -> io::Result<()> {
+        if bufs.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "at least one buffer is required",
+            ));
+        }
+        let iovs: Vec<libc::iovec> = bufs
+            .iter_mut()
+            .map(|b| libc::iovec {
+                iov_base: b.as_mut_ptr().cast(),
+                iov_len: b.len(),
+            })
+            .collect();
+        // SAFETY: fd is the open ring; (op=0 REGISTER_BUFFERS, iovec
+        // array, count) matches io_uring_register(2).
+        let ret = unsafe {
+            libc::syscall(
+                libc::SYS_io_uring_register,
+                self.fd,
+                0usize, // IORING_REGISTER_BUFFERS
+                iovs.as_ptr(),
+                iovs.len(),
+            )
+        };
+        if ret < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        self.buf_addrs = bufs.iter().map(|b| b.as_ptr().addr() as u64).collect();
+        self.buf_count = bufs.len();
+        Ok(())
+    }
+
+    /// Queues a `READ_FIXED` (opcode 4): reads into the registered
+    /// buffer at `buf_index` — no per-op address pin. Requires
+    /// [`Ring::register_buffers`] first; returns `false` (queuing
+    /// nothing) for an unregistered index.
+    pub fn prep_read_fixed(
+        &mut self,
+        user_data: u64,
+        fd: RawFd,
+        buf_index: usize,
+        len: u32,
+        offset: u64,
+    ) -> bool {
+        if buf_index >= self.buf_count {
+            return false;
+        }
+        let slot = (self.tail & self.sq_mask) as usize;
+        // SAFETY: masked slot inside the SQE array. Offsets: opcode@0,
+        // flags@1, ioprio@2, fd@4, off@8, addr@16 (0: table-resolved),
+        // len@24, user_data@32, buf_index@40.
+        unsafe {
+            let sqe = self.sqes_map.0.add(slot * SQE_SIZE);
+            sqe.add(0).write_volatile(4u8); // opcode: READ_FIXED
+            sqe.add(1).write_volatile(0u8);
+            sqe.cast::<u16>().add(1).write_volatile(0u16);
+            sqe.cast::<i32>().add(1).write_volatile(fd);
+            sqe.cast::<u64>().add(1).write_volatile(offset);
+            sqe.cast::<u64>().add(2).write_volatile(
+                self.buf_addrs
+                    .first()
+                    .and_then(|_| self.buf_addrs.get(buf_index))
+                    .copied()
+                    .unwrap_or_default(),
+            );
+            sqe.cast::<u32>().add(6).write_volatile(len);
+            sqe.cast::<u64>().add(4).write_volatile(user_data);
+            sqe.cast::<u16>().add(20).write_volatile(cu16(buf_index));
+        }
+        self.tail = self.tail.wrapping_add(1);
+        self.pending += 1;
+        true
+    }
+
+    /// Queues a `WRITE_FIXED` (opcode 5): writes `len` bytes from the
+    /// registered buffer at `buf_index`. Requires
+    /// [`Ring::register_buffers`] first.
+    pub fn prep_write_fixed(
+        &mut self,
+        user_data: u64,
+        fd: RawFd,
+        buf_index: usize,
+        len: u32,
+        offset: u64,
+    ) -> bool {
+        if buf_index >= self.buf_count {
+            return false;
+        }
+        let slot = (self.tail & self.sq_mask) as usize;
+        // SAFETY: masked slot inside the SQE array, as in
+        // `prep_read_fixed`.
+        unsafe {
+            let sqe = self.sqes_map.0.add(slot * SQE_SIZE);
+            sqe.add(0).write_volatile(5u8); // opcode: WRITE_FIXED
+            sqe.add(1).write_volatile(0u8);
+            sqe.cast::<u16>().add(1).write_volatile(0u16);
+            sqe.cast::<i32>().add(1).write_volatile(fd);
+            sqe.cast::<u64>().add(1).write_volatile(offset);
+            sqe.cast::<u64>().add(2).write_volatile(
+                self.buf_addrs
+                    .first()
+                    .and_then(|_| self.buf_addrs.get(buf_index))
+                    .copied()
+                    .unwrap_or_default(),
+            );
+            sqe.cast::<u32>().add(6).write_volatile(len);
+            sqe.cast::<u64>().add(4).write_volatile(user_data);
+            sqe.cast::<u16>().add(20).write_volatile(cu16(buf_index));
+        }
+        self.tail = self.tail.wrapping_add(1);
+        self.pending += 1;
+        true
+    }
+
     /// Rings the doorbell: submits everything queued and waits until at
     /// least `wait` completions are reaped. Returns the number of SQEs
     /// the kernel accepted.
@@ -339,7 +503,9 @@ impl Ring {
     ///
     /// [`io::Error`] from `io_uring_enter` verbatim.
     pub fn submit_and_wait(&mut self, wait: usize) -> io::Result<usize> {
-        let to_submit = self.pending;
+        // SQPOLL rings: the kernel thread submits from the shared page;
+        // the doorbell side of `enter` must stay zero (EINVAL otherwise).
+        let to_submit = if self.sqpoll { 0 } else { self.pending };
         // Publish the tail before the doorbell (the volatile store plus
         // the syscall's implicit barrier orders the SQE writes).
         // SAFETY: sq ring tail field, inside the mmap'd SQ ring.
@@ -367,7 +533,13 @@ impl Ring {
             return Err(io::Error::last_os_error());
         }
         let accepted = usize::try_from(ret).unwrap_or_default();
-        self.pending -= to_submit.min(self.pending);
+        if self.sqpoll {
+            // The kernel thread owns submission; the app-side pending
+            // count is void the moment the tail page is published.
+            self.pending = 0;
+        } else {
+            self.pending -= to_submit.min(self.pending);
+        }
         Ok(accepted)
     }
 
