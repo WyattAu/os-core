@@ -15,9 +15,15 @@
 //! Scope (v0.1.0): the message header, fixed-width scalar fields,
 //! repeating-group iteration, and varData fields. The schema compiler
 //! (DSL → typed codecs) is pillar VI/K6 territory and deliberately out
-//! of scope here.
+//! of scope here. The pillar-208 ladder ships as the portable default
+//! ([`ladder`]) plus the AVX2 masked gather ([`simd`], feature
+//! `avx2`, ADR-0015).
 
 #![no_std]
+
+pub mod ladder;
+#[cfg(feature = "avx2")]
+pub mod simd;
 
 /// SBE wire-format constants.
 pub mod consts {
