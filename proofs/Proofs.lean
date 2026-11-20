@@ -235,10 +235,9 @@ the Rust oracles assert (`crates/*/tests/refinement.rs`). The spec
 side is now executable: a Rust-side arithmetic change and a Lean-side
 def change must agree or a gate breaks on at least one side.
 
-Note: `wire_create_q_cdw10` states the additive composition — the
-Rust body is `cqid | (qsize0 << 16)` on u32; on disjoint halves the
-bitwise and additive shapes agree, which the mirror theorems make
-exploitable without re-proving the bitwise bridge here.
+Note: the bitwise/additive bridge is proven (`or_shift16_eq_add`
+below), so `wire_create_q_cdw10` carries the Rust `|`/`<<` body
+directly — no additive detour.
 -/
 
 /-- Mirror of `omni_block::wire::cqe_phase_of`: `(dw3 >> 16) & 1`. -/
@@ -251,21 +250,10 @@ theorem wire_cqe_phase_mirror (cid status : Nat)
     wire_cqe_phase (cid + status * 65536) = status % 2 :=
   nvme_cqe_phase_is_high_half_lsb cid status hc hs
 
-/-- Mirror of `omni_block::wire::create_q_cdw10` (additive form; see
-the section note). -/
-def wire_create_q_cdw10 (cqid qsize0 : Nat) : Nat := cqid + qsize0 * 65536
-
-/-- Mirror theorem: the CDW10 low half extracts the queue id. -/
-theorem wire_cdw10_cqid_mirror (cqid qsize0 : Nat) (hc : cqid < 65536) :
-    wire_create_q_cdw10 cqid qsize0 &&& 65535 = cqid :=
-  nvme_create_cq_cqid_extraction cqid qsize0 hc
-
-/-- Mirror theorem: the CDW10 high half extracts the 0-based queue
-size. -/
-theorem wire_cdw10_qsize_mirror (cqid qsize0 : Nat)
-    (hc : cqid < 65536) (hq : qsize0 < 65536) :
-    wire_create_q_cdw10 cqid qsize0 >>> 16 = qsize0 :=
-  nvme_create_cq_qsize_extraction cqid qsize0 hc hq
+/-- Mirror of `omni_block::wire::create_q_cdw10`: `cqid | (qsize0 <<< 16)` —
+the line-for-line form of the Rust u32 body; the bitwise/additive
+bridge below carries the wire theorems onto it. -/
+def wire_create_q_cdw10 (cqid qsize0 : Nat) : Nat := cqid ||| (qsize0 <<< 16)
 
 /-- Mirror of `SpscRing`'s slot index: `pos & (CAP - 1)`. -/
 def spsc_slot (pos cap : Nat) : Nat := pos &&& (cap - 1)
@@ -305,6 +293,62 @@ abbrev cap_contains (base bound addr : Nat) : Prop := base ≤ addr ∧ addr < b
 theorem cap_contains_mirror (base bound addr : Nat)
     (h : cap_contains base bound addr) : addr - base < bound :=
   capability_contains_bound base bound addr h.1 h.2
+
+/- The bitwise/additive bridge (the §48 gap, closed here): on disjoint
+16-bit halves, the wire `|`/`<<` composition IS the additive one. -/
+theorem cdw10_low_bitwise (a b : Nat) (ha : a < 65536) (hb : b < 65536) :
+    (a ||| (b <<< 16)) &&& 65535 = a := by
+  have hmask : (65535 : Nat) = 2 ^ 16 - 1 := rfl
+  rw [hmask, Nat.and_or_distrib_right]
+  have hsh : (b <<< 16) &&& (2 ^ 16 - 1) = 0 := by
+    rw [Nat.shiftLeft_eq, Nat.and_two_pow_sub_one_eq_mod]
+    omega
+  rw [hsh, Nat.or_zero, Nat.and_two_pow_sub_one_eq_mod, Nat.mod_eq_of_lt ha]
+
+theorem cdw10_high_bitwise (a b : Nat) (ha : a < 65536) (hb : b < 65536) :
+    (a ||| (b <<< 16)) >>> 16 = b := by
+  apply Nat.eq_of_testBit_eq
+  intro i
+  rw [Nat.testBit_shiftRight, Nat.testBit_or, Nat.testBit_shiftLeft]
+  have ha16 : Nat.testBit a (16 + i) = false := by
+    have h0 : a >>> 16 = 0 := by
+      rw [Nat.shiftRight_eq_div_pow, show ((2 : Nat) ^ 16) = 65536 from rfl]
+      omega
+    have ht : Nat.testBit a (16 + i) = Nat.testBit (a >>> 16) i :=
+      (Nat.testBit_shiftRight a).symm
+    rw [ht, h0]
+    exact Nat.zero_testBit i
+  rw [ha16]
+  simp
+
+theorem or_shift16_eq_add (a b : Nat) (ha : a < 65536) (hb : b < 65536) :
+    a ||| (b <<< 16) = a + b * 65536 := by
+  have hmask : (65535 : Nat) = 2 ^ 16 - 1 := rfl
+  have hlow := cdw10_low_bitwise a b ha hb
+  have hhigh := cdw10_high_bitwise a b ha hb
+  rw [hmask, Nat.and_two_pow_sub_one_eq_mod] at hlow
+  rw [Nat.shiftRight_eq_div_pow, show ((2 : Nat) ^ 16) = 65536 from rfl] at hhigh
+  have hsplit := Nat.div_add_mod (a ||| (b <<< 16)) 65536
+  rw [hhigh, hlow] at hsplit
+  omega
+
+/-- Mirror theorem: the CDW10 low half extracts the queue id (bitwise
+form; the bounds are the bridge's disjointness hypotheses). -/
+theorem wire_cdw10_cqid_mirror (cqid qsize0 : Nat)
+    (hc : cqid < 65536) (hq : qsize0 < 65536) :
+    wire_create_q_cdw10 cqid qsize0 &&& 65535 = cqid :=
+  cdw10_low_bitwise cqid qsize0 hc hq
+
+/-- Mirror theorem: the CDW10 high half extracts the 0-based queue
+size. -/
+theorem wire_cdw10_qsize_mirror (cqid qsize0 : Nat)
+    (hc : cqid < 65536) (hq : qsize0 < 65536) :
+    wire_create_q_cdw10 cqid qsize0 >>> 16 = qsize0 :=
+  cdw10_high_bitwise cqid qsize0 hc hq
+
+#print axioms or_shift16_eq_add
+#print axioms cdw10_low_bitwise
+#print axioms cdw10_high_bitwise
 
 /- Wire vectors sampled from the Rust oracles: each `decide` below
 matches an asserted case in `crates/*/tests/refinement.rs`. -/
