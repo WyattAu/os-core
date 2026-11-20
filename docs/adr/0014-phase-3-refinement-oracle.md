@@ -53,3 +53,14 @@ long pole of the decade, not of this tranche.
   universal claim; the theorems remain the only universal
   statements. This is a deliberate hardening rung on the
   verification ladder, not the top rung.
+
+**Update 2026-11-20 (§48 first rung):** the spec side is now
+executable too — `proofs/Proofs.lean` grows executable mirror defs
+(`wire_cqe_phase`, `wire_create_q_cdw10`, `spsc_slot`, `heap_page`,
+`cap_contains`) pinned to the theorems above, with `decide`-checked
+vectors matching the Rust oracles' sampled cases. Known gap, tracked
+in the ledger: the `|`/`<<` vs `+`/`*` bitwise bridge for the CDW10
+mirror is deferred (Lean's `Nat` bitwise ops are only propositionally
+the additive composition). Same tranche: `make ci` gains the
+`kernel` leg (`scripts/qemu-omniosk.sh`), closing the local-gate
+mirror of CI's QEMU job.

@@ -56,3 +56,37 @@ fn overflowing_bound_fails_closed() {
     assert!(!cap.contains(u64::MAX));
     assert!(!cap.contains(0));
 }
+
+/// Executes `perm_pack_bounded` (`proofs/Proofs.lean`, goals §184
+/// pattern): every defined permission bit sits inside the low byte, so
+/// packing into a u8 — the MAC-canonical form — is lossless and the
+/// reserved bits stay clear. Expressed in the u32 domain to keep the
+/// mask arithmetic itself the subject (pack = `& 0xFF`).
+#[test]
+fn permission_bits_stay_in_low_byte() {
+    let bits = [
+        omni_cap::perms::READ,
+        omni_cap::perms::WRITE,
+        omni_cap::perms::EXEC,
+        omni_cap::perms::DMA,
+        omni_cap::perms::CXL,
+    ];
+    for bit in bits {
+        assert_eq!(
+            bit & 0xFF,
+            bit,
+            "perm bit packs losslessly into the low byte"
+        );
+    }
+    assert_eq!(
+        omni_cap::perms::ALL & 0xFF,
+        omni_cap::perms::ALL,
+        "the whole defined set packs losslessly"
+    );
+    assert_eq!(omni_cap::perms::ALL.count_ones(), 5, "five defined bits");
+    // The composed token honors the same mask under grants_all.
+    let cap = HardwareCapability::new(0, 0x1000, omni_cap::perms::ALL, 0);
+    assert!(cap.grants_all(omni_cap::perms::ALL));
+    assert!(cap.grants_all(0));
+    assert!(!cap.grants_all(1 << 8), "a reserved bit is never granted");
+}

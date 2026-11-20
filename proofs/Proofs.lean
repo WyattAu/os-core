@@ -224,3 +224,105 @@ theorem ring_window_injective (h1 cap j1 j2 : Nat)
 #print axioms ring_mask_injective
 #print axioms ring_inflight_distinct
 #print axioms ring_window_injective
+
+/-! ### Executable mirrors (ADR-0014 §48 rung)
+
+Each `def` is the Lean form of a Rust helper the crates ship
+(`omni_block::wire`, `SpscRing` slot arithmetic, `PageAlloc`,
+`HardwareCapability::contains`); each mirror theorem pins its def to a
+property proven above, and the `decide` vectors sample the same cases
+the Rust oracles assert (`crates/*/tests/refinement.rs`). The spec
+side is now executable: a Rust-side arithmetic change and a Lean-side
+def change must agree or a gate breaks on at least one side.
+
+Note: `wire_create_q_cdw10` states the additive composition — the
+Rust body is `cqid | (qsize0 << 16)` on u32; on disjoint halves the
+bitwise and additive shapes agree, which the mirror theorems make
+exploitable without re-proving the bitwise bridge here.
+-/
+
+/-- Mirror of `omni_block::wire::cqe_phase_of`: `(dw3 >> 16) & 1`. -/
+def wire_cqe_phase (dw3 : Nat) : Nat := (dw3 >>> 16) &&& 1
+
+/-- Mirror theorem: the executable def satisfies the CQE phase
+placement contract. -/
+theorem wire_cqe_phase_mirror (cid status : Nat)
+    (hc : cid < 65536) (hs : status < 65536) :
+    wire_cqe_phase (cid + status * 65536) = status % 2 :=
+  nvme_cqe_phase_is_high_half_lsb cid status hc hs
+
+/-- Mirror of `omni_block::wire::create_q_cdw10` (additive form; see
+the section note). -/
+def wire_create_q_cdw10 (cqid qsize0 : Nat) : Nat := cqid + qsize0 * 65536
+
+/-- Mirror theorem: the CDW10 low half extracts the queue id. -/
+theorem wire_cdw10_cqid_mirror (cqid qsize0 : Nat) (hc : cqid < 65536) :
+    wire_create_q_cdw10 cqid qsize0 &&& 65535 = cqid :=
+  nvme_create_cq_cqid_extraction cqid qsize0 hc
+
+/-- Mirror theorem: the CDW10 high half extracts the 0-based queue
+size. -/
+theorem wire_cdw10_qsize_mirror (cqid qsize0 : Nat)
+    (hc : cqid < 65536) (hq : qsize0 < 65536) :
+    wire_create_q_cdw10 cqid qsize0 >>> 16 = qsize0 :=
+  nvme_create_cq_qsize_extraction cqid qsize0 hc hq
+
+/-- Mirror of `SpscRing`'s slot index: `pos & (CAP - 1)`. -/
+def spsc_slot (pos cap : Nat) : Nat := pos &&& (cap - 1)
+
+/-- Mirror theorem: the def's output is a valid slot index. -/
+theorem spsc_slot_bounded_mirror (pos k : Nat) (hk : 0 < k) :
+    spsc_slot pos (2 ^ k) < 2 ^ k :=
+  ring_mask_bounded (2 ^ k) k pos rfl hk
+
+/-- Mirror theorem: distinct in-window descriptors never collide on a
+slot (the FIFO-order guarantee, at the def). -/
+theorem spsc_slot_injective_mirror (head j1 j2 k : Nat)
+    (h1 : j1 < 2 ^ k) (h2 : j2 < 2 ^ k)
+    (heq : spsc_slot (head + j1) (2 ^ k) = spsc_slot (head + j2) (2 ^ k)) :
+    j1 = j2 :=
+  ring_mask_injective head j1 j2 k h1 h2 heq
+
+/-- Mirror of `PageAlloc`'s page address: `base + idx * PAGE_SIZE`. -/
+def heap_page (base idx : Nat) : Nat := base + idx * 4096
+
+/-- Mirror theorem: pages stay 4096-aligned for an aligned base. -/
+theorem heap_page_aligned_mirror (base idx : Nat) (h : base % 4096 = 0) :
+    heap_page base idx % 4096 = 0 :=
+  heap_page_aligned base idx h
+
+/-- Mirror theorem: the idx-th page sits below the idx-pages-th. -/
+theorem heap_page_range_mirror (base idx pages : Nat) (h : idx < pages) :
+    heap_page base idx < heap_page base pages := by
+  simp only [heap_page]
+  omega
+
+/-- Mirror of `HardwareCapability::contains` (the non-overflow region
+the Rust fn's fail-closed branch sits outside of). -/
+abbrev cap_contains (base bound addr : Nat) : Prop := base ≤ addr ∧ addr < base + bound
+
+/-- Mirror theorem: containment bounds the offset. -/
+theorem cap_contains_mirror (base bound addr : Nat)
+    (h : cap_contains base bound addr) : addr - base < bound :=
+  capability_contains_bound base bound addr h.1 h.2
+
+/- Wire vectors sampled from the Rust oracles: each `decide` below
+matches an asserted case in `crates/*/tests/refinement.rs`. -/
+example : wire_cqe_phase (1 + 0 * 65536) = 0 := by decide
+example : wire_cqe_phase (2 + 1 * 65536) = 1 := by decide
+example : wire_create_q_cdw10 1 63 &&& 65535 = 1 := by decide
+example : wire_create_q_cdw10 1 63 >>> 16 = 63 := by decide
+example : spsc_slot 9 8 = 1 := by decide
+example : spsc_slot 8 8 = 0 := by decide
+example : heap_page 65536 3 = 77824 := by decide
+example : cap_contains 0 8 7 := by decide
+example : ¬cap_contains 0 8 8 := by decide
+
+#print axioms wire_cqe_phase_mirror
+#print axioms wire_cdw10_cqid_mirror
+#print axioms wire_cdw10_qsize_mirror
+#print axioms spsc_slot_bounded_mirror
+#print axioms spsc_slot_injective_mirror
+#print axioms heap_page_aligned_mirror
+#print axioms heap_page_range_mirror
+#print axioms cap_contains_mirror

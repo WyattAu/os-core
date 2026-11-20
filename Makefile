@@ -42,7 +42,11 @@ contract:
 	./scripts/check-contract.sh
 
 ## What CI gates before merge (mirror of .github/workflows/ci.yml):
-ci: contract fmt-check lint test vet lean
+## `kernel` mirrors the workflow's QEMU job (build + boot + markers).
+ci: contract fmt-check lint test vet lean kernel
+
+kernel:
+	./scripts/qemu-omniosk.sh
 
 repro:
 	./scripts/repro-check.sh
