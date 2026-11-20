@@ -1,0 +1,23 @@
+[package]
+name = "omni-md-server"
+description = "The HFT data plane's HTTP surface: tick query endpoints over the omni-md pipeline (ADR-0017), on the omni-service posture."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "omni-md-server"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+omni-md = { path = "../omni-md", version = "0.1" }
+omni-sbe = { path = "../omni-sbe", version = "0.1" }
+omni-tick = { path = "../omni-tick", version = "0.1" }
+axum.workspace = true
+tokio.workspace = true

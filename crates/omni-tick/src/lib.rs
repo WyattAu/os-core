@@ -13,6 +13,10 @@
 
 #![no_std]
 
+/// Model-check harnesses (`cargo kani`) — local gate only.
+#[cfg(kani)]
+mod kani;
+
 /// Segment container magic: `OMTICK\0\0`.
 pub const MAGIC: &[u8; 8] = b"OMTICK\0\0";
 /// Wire-format version this crate writes and accepts.
