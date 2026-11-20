@@ -43,7 +43,7 @@ first shippable artifacts only.
 |-------------|----------------------|----------------|
 | REQ-T-001 | `make ci` == `.github/workflows/ci.yml` step list | structural |
 | REQ-T-002 | devcontainer postCreate + `make ci` in CI devcontainer job | integration |
-| REQ-OS-001 | loom/miri cfg runs in omni-ring CI; `make bench` vs baseline | model-checked |
+| REQ-OS-001 | loom/miri cfg runs in omni-ring CI; `make bench` vs baseline; refinement oracle `crates/omni-ring/tests/refinement.rs` executes the `proofs/Proofs.lean` ring theorems (ADR-0014) | model-checked |
 | REQ-OS-002 | `lake build` gate over `proofs/` theorem files | machine-checked |
 | REQ-OS-003 | CI lean leg (advisory → gate per loop policy) | structural |
 | REQ-OS-004 | spike bench note + follow-up ADR | empirical |

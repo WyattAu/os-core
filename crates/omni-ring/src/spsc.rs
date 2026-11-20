@@ -10,6 +10,11 @@
 //! slot index is `cursor & (CAP - 1)` — machine-checked bounded in
 //! `proofs/` as `ring_index_bounded`.
 //!
+//! Phase-3 link (ADR-0011): the ring theorems in `proofs/Proofs.lean`
+//! are *executed* against this implementation by
+//! `tests/refinement.rs` — a regression in the cursor/mask/window
+//! arithmetic breaks those tests, and with them `make ci`.
+//!
 //! Ordering: producer writes the slot with `Release` *before* advancing
 //! `head` with `Release`; consumer reads `head` with `Acquire`, then the
 //! slot, then advances `tail` with `Release`; producer reads `tail` with
