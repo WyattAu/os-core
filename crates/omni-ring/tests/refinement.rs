@@ -114,3 +114,32 @@ fn slot_table_payloads_never_alias_or_double_deliver() {
     assert_eq!(table.write(big, 7), None, "descriptor >= N rejected");
     assert_eq!(table.take(big), None, "descriptor >= N never delivers");
 }
+
+/// The `Kani wrap_seam_fifo` trace, on the host: fill 8 sentinels,
+/// drain 3, push 3 fresh, drain all — exact FIFO. Mirrors
+/// src/kani.rs (the model-check pilot).
+#[test]
+fn kani_trace_on_host() {
+    const CAP: usize = 8;
+    let ring: SpscRing<CAP> = SpscRing::new();
+    let (x, y, z) = (1u64, 2u64, 3u64);
+    for _ in 0..CAP {
+        assert_eq!(ring.try_push(0), None, "fill");
+    }
+    for _ in 0..3 {
+        assert_eq!(ring.try_pop(), Some(0), "drain sentinels");
+    }
+    assert!(ring.try_push(x).is_none(), "seam push x");
+    assert!(ring.try_push(y).is_none(), "seam push y");
+    assert!(ring.try_push(z).is_none(), "seam push z");
+    assert!(ring.is_full(), "8 - 3 + 3 in flight");
+    // FIFO order spans the WHOLE window: the five surviving sentinel
+    // slots (3..8) precede the wrapped x/y/z (slots 0..3).
+    for _ in 0..5 {
+        assert_eq!(ring.try_pop(), Some(0), "old sentinels");
+    }
+    assert_eq!(ring.try_pop(), Some(x), "post-seam x");
+    assert_eq!(ring.try_pop(), Some(y), "post-seam y");
+    assert_eq!(ring.try_pop(), Some(z), "post-seam z");
+    assert!(ring.try_pop().is_none(), "empty");
+}

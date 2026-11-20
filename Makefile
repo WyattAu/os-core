@@ -51,6 +51,11 @@ kernel:
 repro:
 	./scripts/repro-check.sh
 
+# LOCAL leg (not in ci): Kani model-check over the ring cursor algebra
+# (ADR-0014 rung C+). Runners don't ship kani.
+kani:
+	./scripts/check-kani.sh
+
 bench:
 	./scripts/bench-budget.sh
 

@@ -34,4 +34,8 @@
 #[cfg(feature = "mpmc")]
 pub mod mpmc;
 pub mod slot;
+
+/// Model-check harnesses (`cargo kani`) — local gate only.
+#[cfg(kani)]
+mod kani;
 pub mod spsc;

@@ -48,7 +48,7 @@ first shippable artifacts only.
 | REQ-OS-003 | CI lean leg (advisory → gate per loop policy) | structural |
 | REQ-OS-004 | spike bench note + follow-up ADR | empirical |
 | REQ-OS-004 (follow-up) | `omni-io`: raw-syscall io_uring seam (ADR-0016), host smokes (NOP drain, file roundtrip, SQPOLL drain, fixed-buffer roundtrip, hostile-entry rejection) green on Linux; A53 `5.10` SQPOLL numbers pending hardware-session re-validation | empirical + model |
-| REQ-OS-010 | `omni-tick`: fixed-width 32-byte tick record + append-only segment container (ADR-0017); format proptests of record (roundtrip, replay order, header validation, hostile-count rejection) | model |
+| REQ-OS-001 (model) | `cargo kani` harnesses over the SPSC cursor algebra (`src/kani.rs`, `make kani` local leg, ADR-0014 rung C+): index bounded, FIFO at depth 2, full-reject identity, wrap-seam FIFO — all verified, no counterexamples | machine-checked |: fixed-width 32-byte tick record + append-only segment container (ADR-0017); format proptests of record (roundtrip, replay order, header validation, hostile-count rejection) | model |
 | REQ-OS-005 | omniosk unit tests over mock port sink; boot path per ADR-0013 | unit + design |
 | REQ-OS-006 | `NVME WRITE PASS` serial marker, asserted required in `scripts/qemu-omniosk.sh` (write -> read-back -> byte-compare in-kernel); wire helpers `omni_block::wire` consumed by the kernel, oracle `crates/omni-block/tests/refinement.rs` executes the `proofs/Proofs.lean` NVMe theorems (ADR-0014) | empirical + model-checked |
 | REQ-OS-007 | proptest model equivalence (`crates/omni-heap/tests/model.rs`) + `heap_page_aligned` / `heap_page_in_range` Lean theorems | model-checked |

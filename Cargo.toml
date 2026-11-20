@@ -16,7 +16,7 @@ repository = "https://github.com/WyattAu/os-core"
 [workspace.lints.rust]
 unsafe_code = "deny"
 missing_docs = "warn"
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)', 'cfg(kani)'] }
 
 [workspace.lints.clippy]
 all = { level = "deny", priority = -1 }

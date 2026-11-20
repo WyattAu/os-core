@@ -717,6 +717,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "omni-md"
+version = "0.1.0"
+dependencies = [
+ "omni-ring",
+ "omni-sbe",
+ "omni-tick",
+]
+
+[[package]]
 name = "omni-ring"
 version = "0.2.0"
 dependencies = [
