@@ -54,3 +54,11 @@ not production hardening.
 - **Risk**: "append + scan" replay cost grows linearly with segment
   history; the mitigation (segment index/range trees) is a Phase-3
   tranche, deferred until the feed volume demands it.
+
+**Update 2026-11-21 (CRC trailer shipped):** the segment format gains
+the tracked integrity feature — a CRC32 (IEEE, `crc32fast`) trailer in
+the buffer's last 4 bytes, streamed per push by `crc32fast::Hasher`
+and verified on `open`. Bit rot and truncation are rejected, never
+replayed. Format version 2; omni-tick 0.2.0 (breaking, honest semver —
+the Tick type crosses omni-md/omni-md-server, both bumped to 0.2.0).
+Boundary note unchanged: CRC detects rot, it is not an adversarial MAC.
