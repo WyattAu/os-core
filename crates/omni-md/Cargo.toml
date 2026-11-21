@@ -1,7 +1,7 @@
 [package]
 name = "omni-md"
 description = "Market-data pipeline: ingest -> decode -> fan-out -> persist seams (ADR-0017, the HFT data plane's server half)."
-version.workspace = true
+version = "0.2.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -14,4 +14,4 @@ workspace = true
 [dependencies]
 omni-ring = { path = "../omni-ring", version = "0.2" }
 omni-sbe = { path = "../omni-sbe", version = "0.1" }
-omni-tick = { path = "../omni-tick", version = "0.1" }
+omni-tick = { path = "../omni-tick", version = "0.2" }

@@ -260,6 +260,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d07550c9036bf2ae0c684c4297d503f838287c83c53686d05370d0e139ae570"
 
 [[package]]
+name = "crc32fast"
+version = "1.5.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2b929dd2a135771f40afabd1073f85eed59c800b7c61901e5c254270497dad64"
+dependencies = [
+ "cfg-if",
+]
+
+[[package]]
 name = "criterion"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -718,7 +727,7 @@ dependencies = [
 
 [[package]]
 name = "omni-md"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "omni-ring",
  "omni-sbe",
@@ -727,7 +736,7 @@ dependencies = [
 
 [[package]]
 name = "omni-md-server"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "axum",
  "omni-md",
@@ -773,7 +782,10 @@ dependencies = [
 
 [[package]]
 name = "omni-tick"
-version = "0.1.0"
+version = "0.2.0"
+dependencies = [
+ "crc32fast",
+]
 
 [[package]]
 name = "omniosk"

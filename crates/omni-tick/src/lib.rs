@@ -20,12 +20,14 @@ mod kani;
 /// Segment container magic: `OMTICK\0\0`.
 pub const MAGIC: &[u8; 8] = b"OMTICK\0\0";
 /// Wire-format version this crate writes and accepts.
-pub const FORMAT_VERSION: u16 = 1;
+pub const FORMAT_VERSION: u16 = 2;
 /// Record size in bytes (fixed at 32 by ADR-0017).
 pub const TICK_SIZE: usize = 32;
 /// Segment header size in bytes (magic 8, version 2, record size 2,
 /// count 4).
 pub const HEADER_SIZE: usize = 16;
+/// CRC32 trailer size in bytes (the segment's last 4).
+pub const CRC_SIZE: usize = 4;
 
 /// One market-data tick, fixed width, little-endian on the wire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,14 +119,26 @@ impl Tick {
 /// enforces the format.
 pub struct SegmentBuf<'a> {
     buf: &'a mut [u8],
+    /// Streaming CRC32 of the record region (records only, not the
+    /// header or the trailer) — updated per push, published in the
+    /// trailer at every write.
+    crc: crc32fast::Hasher,
 }
 
 impl<'a> SegmentBuf<'a> {
+    /// The segment's record capacity for a buffer of `len` bytes:
+    /// header + records + CRC trailer must all fit.
+    #[must_use]
+    pub fn capacity_for(len: usize) -> usize {
+        len.saturating_sub(HEADER_SIZE + CRC_SIZE) / TICK_SIZE
+    }
+
     /// Wraps an empty buffer and writes the segment header. Returns
-    /// `None` when the buffer cannot hold a header plus one record —
-    /// a segment that cannot store a tick is not a segment.
+    /// `None` when the buffer cannot hold a header, one record, and
+    /// the CRC trailer — a segment that cannot store a tick is not a
+    /// segment.
     pub fn init(buf: &'a mut [u8]) -> Option<Self> {
-        if buf.len() < HEADER_SIZE + TICK_SIZE {
+        if buf.len() < HEADER_SIZE + CRC_SIZE + TICK_SIZE {
             return None;
         }
         put_u32(buf, 0, 0); // magic low half
@@ -138,14 +152,21 @@ impl<'a> SegmentBuf<'a> {
         put_u16(buf, 8, FORMAT_VERSION);
         put_u16(buf, 10, u16::try_from(TICK_SIZE).unwrap_or_default());
         put_u32(buf, 12, 0); // count
-        Some(Self { buf })
+        put_u32(buf, buf.len() - CRC_SIZE, 0); // CRC32 of zero records
+        Some(Self {
+            buf,
+            crc: crc32fast::Hasher::new(),
+        })
     }
 
     /// Wraps an existing populated segment (e.g. an mmap'd file page)
-    /// and validates its header. `None` on a foreign/malformed header.
+    /// and validates its header AND CRC trailer. `None` on a
+    /// foreign/malformed header, a declared count past the buffer, or
+    /// a CRC mismatch — bit rot and truncation are rejected, never
+    /// replayed.
     #[must_use]
     pub fn open(buf: &'a mut [u8]) -> Option<Self> {
-        if buf.len() < HEADER_SIZE {
+        if buf.len() < HEADER_SIZE + CRC_SIZE + TICK_SIZE {
             return None;
         }
         let m0 = get_u32(buf, 0)?;
@@ -163,10 +184,24 @@ impl<'a> SegmentBuf<'a> {
             return None;
         }
         let count = get_u32(buf, 12)?;
-        if HEADER_SIZE + count as usize * TICK_SIZE > buf.len() {
+        let records_len = usize::try_from(count)
+            .ok()
+            .and_then(|c| c.checked_mul(TICK_SIZE))?;
+        let end = HEADER_SIZE.checked_add(records_len)?;
+        if end + CRC_SIZE > buf.len() {
             return None; // declared count past the buffer: hostile
         }
-        Some(Self { buf })
+        // CRC trailer: the buffer's last 4 bytes, over the record
+        // region only.
+        let stored = get_u32(buf, buf.len() - CRC_SIZE)?;
+        let mut crc = crc32fast::Hasher::new();
+        if let Some(region) = buf.get(HEADER_SIZE..end) {
+            crc.update(region);
+        }
+        if crc.clone().finalize() != stored {
+            return None;
+        }
+        Some(Self { buf, crc })
     }
 
     /// Appends a tick. `false` when the segment is full — callers
@@ -179,14 +214,21 @@ impl<'a> SegmentBuf<'a> {
         let Some(end) = HEADER_SIZE.checked_add(total) else {
             return false;
         };
-        if end > self.buf.len() {
+        if end + CRC_SIZE > self.buf.len() {
             return false;
         }
         let slot = HEADER_SIZE + count * TICK_SIZE;
         if let Some(rec) = self.buf.get_mut(slot..end) {
             tick.encode(rec);
+            // Streaming CRC: the trailer always reflects every record.
+            self.crc.update(rec);
         }
         put_u32(self.buf, 12, u32::try_from(count + 1).unwrap_or_default());
+        put_u32(
+            self.buf,
+            self.buf.len() - CRC_SIZE,
+            self.crc.clone().finalize(),
+        );
         true
     }
 

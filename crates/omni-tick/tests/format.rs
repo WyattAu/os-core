@@ -1,7 +1,7 @@
 //! omni-tick format tests: tick wire roundtrip, segment append/replay,
 //! header validation, and hostile-extent rejection (REQ-OS-010).
 
-use omni_tick::{SegmentBuf, Tick, HEADER_SIZE, TICK_SIZE};
+use omni_tick::{SegmentBuf, Tick, CRC_SIZE, HEADER_SIZE, TICK_SIZE};
 
 fn tick(i: u64) -> Tick {
     Tick {
@@ -41,7 +41,7 @@ fn short_wire_rejected() {
 
 #[test]
 fn segment_append_replay_in_order() {
-    let mut backing = [0u8; HEADER_SIZE + 8 * TICK_SIZE];
+    let mut backing = [0u8; HEADER_SIZE + 8 * TICK_SIZE + CRC_SIZE];
     let mut seg = must_some(SegmentBuf::init(&mut backing), "init");
     for i in 0..8u64 {
         assert!(seg.push(&tick(i)), "push {i} of 8 fits");
@@ -57,7 +57,7 @@ fn segment_append_replay_in_order() {
 #[test]
 fn segment_open_validates_header() {
     // A foreign buffer (zeroed) must not open as a segment.
-    let mut backing = [0u8; HEADER_SIZE + 4 * TICK_SIZE];
+    let mut backing = [0u8; HEADER_SIZE + 4 * TICK_SIZE + CRC_SIZE];
     assert!(
         SegmentBuf::open(&mut backing).is_none(),
         "zeroed buffer has no magic"
@@ -78,7 +78,7 @@ fn segment_open_validates_header() {
 
 #[test]
 fn hostile_count_rejected_on_open() {
-    let mut backing = [0u8; HEADER_SIZE + 2 * TICK_SIZE];
+    let mut backing = [0u8; HEADER_SIZE + 2 * TICK_SIZE + CRC_SIZE];
     {
         let mut seg = must_some(SegmentBuf::init(&mut backing), "init");
         assert!(seg.push(&tick(1)));
@@ -102,4 +102,58 @@ fn tiny_segment_rejected_at_init() {
         SegmentBuf::init(&mut tiny).is_none(),
         "a segment that cannot hold a record is not a segment"
     );
+}
+
+#[test]
+fn crc_corruption_rejected_on_open() {
+    let mut backing = [0u8; HEADER_SIZE + 3 * TICK_SIZE + CRC_SIZE];
+    {
+        let mut seg = must_some(SegmentBuf::init(&mut backing), "init");
+        for i in 0..3u64 {
+            assert!(seg.push(&tick(i)), "push {i}");
+        }
+    }
+    // Flip one byte inside the record region: the CRC must catch it.
+    let record_byte = HEADER_SIZE + 5;
+    flip_byte(&mut backing, record_byte);
+    assert!(
+        SegmentBuf::open(&mut backing).is_none(),
+        "record corruption rejected"
+    );
+    // Heal and flip the TRAILER instead: still rejected.
+    flip_byte(&mut backing, record_byte);
+    let trailer_byte = backing.len() - 1;
+    flip_byte(&mut backing, trailer_byte);
+    assert!(
+        SegmentBuf::open(&mut backing).is_none(),
+        "trailer corruption rejected"
+    );
+    // Heal: the intact segment opens and replays.
+    flip_byte(&mut backing, trailer_byte);
+    let seg = must_some(SegmentBuf::open(&mut backing), "healed segment opens");
+    assert_eq!(seg.count(), 3, "count intact");
+    assert_eq!(
+        seg.get(2).map(|t| t.ts_ns),
+        Some(tick(2).ts_ns),
+        "records intact"
+    );
+}
+
+#[test]
+fn capacity_accounts_for_the_trailer() {
+    // A buffer sized exactly for header + 2 records + trailer holds
+    // exactly 2 records — the trailer is not spare record space.
+    let mut backing = [0u8; HEADER_SIZE + 2 * TICK_SIZE + CRC_SIZE];
+    let mut seg = must_some(SegmentBuf::init(&mut backing), "init");
+    assert!(seg.push(&tick(0)));
+    assert!(seg.push(&tick(1)));
+    assert!(!seg.push(&tick(2)), "trailer bytes are not record space");
+}
+
+/// Flips every bit of `buf[off]` (bounds-checked; off is in range by
+/// construction at every call site).
+fn flip_byte(buf: &mut [u8], off: usize) {
+    if let Some(b) = buf.get_mut(off) {
+        *b ^= 0xFF;
+    }
 }

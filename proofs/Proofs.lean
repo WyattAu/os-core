@@ -362,6 +362,63 @@ theorem wire_cdw10_qsize_mirror (cqid qsize0 : Nat)
 #print axioms cdw10_low_bitwise
 #print axioms cdw10_high_bitwise
 
+/-! ### NVMe session cursor machine (the kernel's completion cursor)
+
+`omniosk-kernel/src/nvme.rs` advances the I/O completion cursor per
+consumed CQE: the index wraps at the ring's own size (`IO_QSIZE`), and
+the phase flips exactly on that wrap. The modulus bug that cost the
+blockcheck sessions was an advance that wrapped at the ADMIN size —
+these defs mirror the FIXED kernel formulas and the theorems pin the
+two properties the kernel session proved empirically: the index never
+leaves the ring, and the phase flips ONLY at the wrap.
+-/
+
+/-- Mirror of the kernel's cursor advance (nvme.rs: `cqe_idx += 1;
+if cqe_idx >= IO_QSIZE { cqe_idx = 0; phase ^= 1 }`). -/
+def cursor_advance (idx phase qsize : Nat) : Nat × Nat :=
+  ((idx + 1) % qsize, if idx + 1 = qsize then (phase + 1) % 2 else phase)
+
+/-- **Cursor index never leaves the ring** — the invariant whose
+violation (an admin-size modulus) stranded the blockcheck task. -/
+theorem cursor_advance_bounded (idx phase qsize : Nat) (hq : 0 < qsize) :
+    (cursor_advance idx phase qsize).1 < qsize := by
+  simp only [cursor_advance]
+  exact Nat.mod_lt _ hq
+
+/-- **No early wrap**: below the ring size the index simply
+increments and the phase is UNCHANGED — the exact regression class of
+the admin-size modulus bug (advance(3, 1, 64) must be (4, 1), never
+(0, 0)). -/
+theorem cursor_advance_no_early_wrap (idx phase qsize : Nat)
+    (hq : idx + 1 < qsize) :
+    (cursor_advance idx phase qsize).1 = idx + 1 ∧
+    (cursor_advance idx phase qsize).2 = phase := by
+  have hflip : ¬(idx + 1 = qsize) := by omega
+  have h1 : (cursor_advance idx phase qsize).1 = idx + 1 := by
+    simp only [cursor_advance]
+    exact Nat.mod_eq_of_lt hq
+  have h2 : (cursor_advance idx phase qsize).2 = phase := by
+    simp only [cursor_advance, if_neg hflip]
+  exact ⟨h1, h2⟩
+
+/-- **Phase flips exactly at the wrap**: the boundary advance —
+idx + 1 = qsize — carries the index to 0 and inverts the phase, so
+(slot, phase) pairs stay unique per device cycle. -/
+theorem cursor_advance_flips_at_wrap (idx phase qsize : Nat)
+    (hq : 0 < qsize) (h : idx + 1 = qsize) :
+    (cursor_advance idx phase qsize).1 = 0 ∧
+    (cursor_advance idx phase qsize).2 = (phase + 1) % 2 := by
+  have h1 : (cursor_advance idx phase qsize).1 = 0 := by
+    simp only [cursor_advance]
+    rw [h, Nat.mod_self]
+  have h2 : (cursor_advance idx phase qsize).2 = (phase + 1) % 2 := by
+    simp only [cursor_advance, if_pos h]
+  exact ⟨h1, h2⟩
+
+#print axioms cursor_advance_bounded
+#print axioms cursor_advance_no_early_wrap
+#print axioms cursor_advance_flips_at_wrap
+
 /- Wire vectors sampled from the Rust oracles: each `decide` below
 matches an asserted case in `crates/*/tests/refinement.rs`. -/
 example : wire_cqe_phase (1 + 0 * 65536) = 0 := by decide
@@ -372,6 +429,9 @@ example : spsc_slot 9 8 = 1 := by decide
 example : spsc_slot 8 8 = 0 := by decide
 example : heap_page 65536 3 = 77824 := by decide
 example : cap_contains 0 8 7 := by decide
+example : cursor_advance 3 1 64 = (4, 1) := by decide
+example : cursor_advance 63 1 64 = (0, 0) := by decide
+example : cursor_advance 62 1 64 = (63, 1) := by decide
 example : ¬cap_contains 0 8 8 := by decide
 
 #print axioms wire_cqe_phase_mirror
