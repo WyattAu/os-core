@@ -726,6 +726,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "omni-md-server"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "omni-md",
+ "omni-sbe",
+ "omni-tick",
+ "tokio",
+]
+
+[[package]]
 name = "omni-ring"
 version = "0.2.0"
 dependencies = [
@@ -737,7 +748,7 @@ dependencies = [
 
 [[package]]
 name = "omni-sbe"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "proptest",
 ]
