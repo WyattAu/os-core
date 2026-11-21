@@ -249,9 +249,91 @@ impl<'a> SegmentBuf<'a> {
         Tick::decode(rec)
     }
 
+    /// The timestamp of the last record in the segment; `None` when
+    /// the segment is empty (pillar LIV goal 530's ordering anchor).
+    #[must_use]
+    pub fn last_ts(&self) -> Option<u64> {
+        self.get(self.count().checked_sub(1)?).map(|t| t.ts_ns)
+    }
+
+    /// The raw timestamp of record `i` (header offset 0 of the
+    /// record); `None` when out of range. O(1) — no decode.
+    fn ts_at(&self, i: u32) -> Option<u64> {
+        let off = HEADER_SIZE + i as usize * TICK_SIZE;
+        get_u64(self.buf, off)
+    }
+
+    /// Appends a tick, enforcing pillar LIV goal 530's monotonic
+    /// timestamp invariant: the tick's `ts_ns` must be strictly
+    /// greater than the last record's. Out-of-order and duplicate
+    /// timestamps are rejected — the store never reorders on the
+    /// caller's behalf (goal 530's tie-break injection is an ingress
+    /// concern, not a store concern).
+    ///
+    /// # Errors
+    ///
+    /// [`PushError::OutOfOrder`] for a non-advancing timestamp;
+    /// [`PushError::Full`] when the segment is at capacity.
+    pub fn push_monotonic(&mut self, tick: &Tick) -> Result<(), PushError> {
+        if let Some(last) = self.last_ts() {
+            if tick.ts_ns <= last {
+                return Err(PushError::OutOfOrder);
+            }
+        }
+        if !self.push(tick) {
+            return Err(PushError::Full);
+        }
+        Ok(())
+    }
+
+    /// Replay of the records whose timestamps fall in
+    /// `[ts_start, ts_end)` — O(log n) slice bounds via binary search
+    /// over the monotonic record order (pillar LIV goal 526's
+    /// pointer-arithmetic reduction).
+    ///
+    /// Meaningful only for segments built with [`SegmentBuf::push`]
+    /// after monotonic feeding (ascending `ts_ns`); a non-monotonic
+    /// segment's range output is unspecified.
+    pub fn range(&self, ts_start: u64, ts_end: u64) -> impl Iterator<Item = Tick> + '_ {
+        // Binary search the monotonic region for the slice bounds.
+        let start_idx = self.partition_point_ts(ts_start);
+        let end_idx = self.partition_point_ts(ts_end);
+        let count = self.count();
+        let lo = start_idx.min(count);
+        let hi = end_idx.min(count);
+        ((lo)..hi).filter_map(move |i| self.get(i))
+    }
+
+    /// First record index whose timestamp is >= `ts` (partition
+    /// point over the monotonic record order).
+    fn partition_point_ts(&self, ts: u64) -> u32 {
+        let count = self.count();
+        let mut lo = 0u32;
+        let mut hi = count;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            match self.ts_at(mid) {
+                Some(t) if t < ts => lo = mid + 1,
+                _ => hi = mid,
+            }
+        }
+        lo
+    }
+
     /// Replay: every record in order.
     pub fn replay(&self) -> impl Iterator<Item = Tick> + '_ {
         let count = self.count();
         (0..count).filter_map(move |i| self.get(i))
     }
+}
+
+/// [`SegmentBuf::push_monotonic`] failure kinds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PushError {
+    /// The tick's timestamp does not advance past the last record
+    /// (pillar LIV goal 530: out-of-order and duplicate timestamps
+    /// are rejected, never reordered).
+    OutOfOrder,
+    /// The segment is at capacity.
+    Full,
 }

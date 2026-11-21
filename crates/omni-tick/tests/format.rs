@@ -157,3 +157,69 @@ fn flip_byte(buf: &mut [u8], off: usize) {
         *b ^= 0xFF;
     }
 }
+
+// ---- Pillar LIV: monotonic invariant (530) + range queries (526). ----
+
+#[test]
+fn monotonic_push_enforces_strict_order() {
+    let mut backing = [0u8; HEADER_SIZE + 4 * TICK_SIZE + CRC_SIZE];
+    let mut seg = must_some(SegmentBuf::init(&mut backing), "init");
+    assert!(seg.push_monotonic(&tick(0)).is_ok(), "first tick always in");
+    assert!(seg.push_monotonic(&tick(1)).is_ok(), "advancing tick in");
+    // Duplicate timestamp: rejected (strictly greater required).
+    assert_eq!(
+        seg.push_monotonic(&tick(1)),
+        Err(omni_tick::PushError::OutOfOrder),
+        "duplicate ts rejected"
+    );
+    // Descending: rejected.
+    assert_eq!(
+        seg.push_monotonic(&tick(0)),
+        Err(omni_tick::PushError::OutOfOrder),
+        "out-of-order rejected"
+    );
+    assert_eq!(seg.count(), 2, "rejected ticks are not stored");
+    assert_eq!(seg.last_ts(), Some(tick(1).ts_ns), "last anchor tracks");
+}
+
+#[test]
+fn monotonic_full_is_full_error() {
+    let mut backing = [0u8; HEADER_SIZE + 2 * TICK_SIZE + CRC_SIZE];
+    let mut seg = must_some(SegmentBuf::init(&mut backing), "init");
+    assert!(seg.push_monotonic(&tick(0)).is_ok());
+    assert!(seg.push_monotonic(&tick(1)).is_ok());
+    assert_eq!(
+        seg.push_monotonic(&tick(2)),
+        Err(omni_tick::PushError::Full),
+        "capacity exhaustion reports Full, not OutOfOrder"
+    );
+}
+
+#[test]
+fn range_query_binary_search_over_monotonic_segment() {
+    let mut backing = [0u8; HEADER_SIZE + 8 * TICK_SIZE + CRC_SIZE];
+    let mut seg = must_some(SegmentBuf::init(&mut backing), "init");
+    for i in 0..8u64 {
+        let mut t = tick(i);
+        t.ts_ns = 1000 + i * 100; // strictly ascending
+        assert!(seg.push_monotonic(&t).is_ok(), "push {i}");
+    }
+    // [1100, 1400): records 1, 2, 3.
+    let in_range: Vec<u64> = seg.range(1100, 1400).map(|t| t.ts_ns).collect();
+    assert_eq!(in_range, vec![1100, 1200, 1300], "half-open range");
+    // Empty range: end before start.
+    assert!(
+        seg.range(1400, 1100).next().is_none(),
+        "inverted range empty"
+    );
+    // Boundary: start == a record's ts includes it; end excludes it.
+    assert_eq!(
+        seg.range(1000, 1000).count(),
+        0,
+        "empty at zero-width range"
+    );
+    // Past-the-end range is empty.
+    assert!(seg.range(9900, 9999).next().is_none(), "beyond the data");
+    // Full range returns everything.
+    assert_eq!(seg.range(0, u64::MAX).count(), 8, "full range = replay");
+}

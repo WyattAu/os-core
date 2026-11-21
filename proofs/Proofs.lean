@@ -415,6 +415,23 @@ theorem cursor_advance_flips_at_wrap (idx phase qsize : Nat)
     simp only [cursor_advance, if_pos h]
   exact ⟨h1, h2⟩
 
+/-- Mirror of omni-tick's monotonic push (pillar LIV goal 530,
+`SegmentBuf::push_monotonic`): the segment's last timestamp is
+`saturating_max(last, ts)` — it only moves forward. -/
+def store_last_ts (last ts : Nat) : Nat := if last < ts then ts else last
+
+/-- **The store's ordering invariant, at the def**: the last timestamp
+after any accepted push is at least the previous last — accepted ticks
+never move the ordering anchor backward. -/
+theorem store_last_ts_monotonic (last ts : Nat) :
+    store_last_ts last ts >= last := by
+  simp only [store_last_ts]
+  split
+  · omega
+  · omega
+
+#print axioms store_last_ts_monotonic
+
 #print axioms cursor_advance_bounded
 #print axioms cursor_advance_no_early_wrap
 #print axioms cursor_advance_flips_at_wrap
