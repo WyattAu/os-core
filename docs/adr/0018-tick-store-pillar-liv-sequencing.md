@@ -52,3 +52,14 @@ before any FPGA/GPU form exists.
 - **Risk**: `range` on a non-monotonic segment is *unspecified*
   output — documented, but a caller could still do it; a debug-mode
   monotonic scan is a possible future guard.
+
+**Update 2026-11-21 (522 landed):** Gorilla XOR compression shipped as
+`omni_tick::gorilla` — the software form of goal 522. Format: first
+value raw LE, then per value a control bit (unchanged = one bit) or
+6-bit trailing zeros + 6-bit (length - 1) + payload. Trailing+length
+(derived leading) rather than Gorilla's leading+length: a 5-bit lead
+field cannot express deep-lead deltas, which is exactly where small
+price drift lives. Roundtrip proptest over arbitrary streams; drift
+streams compress below half raw. The FPGA single-cycle pipeline form
+(522's full claim) stays K5-gated; 528 (OHLCV bars) is the next
+software item in the LIV queue.

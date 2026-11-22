@@ -44,6 +44,13 @@ crates/omni-ring      L0 leaf: wait-free SPSC + lock-free MPMC rings (REQ-OS-001
 crates/omni-cap       L0 leaf: 64-byte capability token (REQ-OS-002)
 crates/omni-service   L3 example: axum, health/ready, graceful shutdown
 crates/omni-cli       example clap binary composing on omni-core
+crates/omni-io        K2 leaf: Linux io_uring seam over raw syscalls (REQ-OS-004)
+crates/omni-tick      store: fixed-width tick record + append-only segment store (REQ-OS-010)
+crates/omni-md        data plane: SBE frame -> tick decode + descriptor fan-out (ADR-0017)
+crates/omni-md-server the data plane's HTTP surface: /ticks/latest/{n}, /stats
+crates/omni-task      cooperative scheduler with Sleep(n) slots (REQ-OS-008)
+crates/omni-block     BlockDevice seam: BlockRam + NVMe session impl (REQ-OS-006)
+crates/omni-heap      bitmap page allocator (REQ-OS-007)
 crates/omniosk        K4 seed: no_std kernel-adjacent modules (REQ-OS-005, ADR-0013)
 kernels/omniosk-kernel QEMU-bootable PVH kernel: verified ring on bare metal (excluded from workspace gates; `scripts/qemu-omniosk.sh`)
 proofs/               Lean 4 theorems backing ring/cap properties (REQ-OS-002/003)

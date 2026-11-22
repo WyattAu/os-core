@@ -86,3 +86,44 @@ fn fanout_delivers_in_publish_order() {
     assert!(fan.is_empty(), "drained to empty");
     assert!(fan.drain_one().is_none(), "empty drain is None");
 }
+
+// ---- Pillar XXV: the tick-to-trade decision stage. ----
+
+use omni_md::strategy::{decide, Side};
+
+#[test]
+fn strategy_reacts_to_bid_movement() {
+    let t = Tick {
+        ts_ns: 1,
+        instrument: 1,
+        flags: 0,
+        bid_px: 1000,
+        ask_px: 1002,
+    };
+    let frame = encode_frame(&t);
+
+    // No previous bid: no opinion.
+    assert!(decide(&frame, None).is_none(), "cold start has no opinion");
+
+    // Bid up from 1000 to 1000: spread 2, bid not above prev — no trade.
+    assert!(
+        decide(&frame, Some(1000)).is_none(),
+        "no movement, no trade"
+    );
+
+    // Bid up: buy.
+    let outcome = decide(&frame, Some(999));
+    assert!(outcome.is_some(), "bid above prev buys");
+    let (side, decoded) = outcome.unwrap_or((Side::Buy, t));
+    assert_eq!(side, Side::Buy);
+    assert_eq!(
+        decoded.bid_px, 1000,
+        "the decoded tick rides with the decision"
+    );
+
+    // Ask below the previous bid: sell into the printed bid.
+    let outcome = decide(&frame, Some(1003));
+    assert!(outcome.is_some(), "ask below prev sells");
+    let (side, _) = outcome.unwrap_or((Side::Sell, t));
+    assert_eq!(side, Side::Sell);
+}

@@ -14,6 +14,8 @@
 #![no_std]
 
 /// Model-check harnesses (`cargo kani`) — local gate only.
+pub mod gorilla;
+
 #[cfg(kani)]
 mod kani;
 

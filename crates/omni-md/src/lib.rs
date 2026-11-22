@@ -12,6 +12,7 @@
 #![no_std]
 
 pub mod fanout;
+pub mod strategy;
 
 use omni_sbe::SbeDecoder;
 use omni_tick::Tick;

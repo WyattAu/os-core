@@ -38,14 +38,17 @@
      bring-up), but it is the board the HFT stack already targets.
    Decision needed: which board is "the one board".
 2. **Tick-to-trade demo on one board** (Phase 2, hft pillars XXII–XXVI).
-   The software form is unblocked NOW: omni-io feed socket →
-   omni-sbe decode → strategy decision → omni-tick persist, latency-
-   instrumented, on the A53. This is the Phase-2 revenue-shaped demo.
+   The SOFTWARE form is done (2026-11-21): omni-md's
+   `tick_to_trade` example runs the whole plane per tick — SBE
+   encode → decode → strategy decide → segment persist — at 33 ns
+   min / 36 ns p50 (release), 169 trades over 256 ticks. The BOARD
+   form (real feed socket + the A53) is the remaining half.
 3. **Server/database first designs** (store/db pillars XLVII–LVI) —
    started: ADR-0017 + omni-tick are pillar LIV's software form
    (521 lock-free tick log; 530 monotonic invariant; 526 epoch/range
-   queries this tranche). Queued from LIV: Gorilla XOR compression
-   (522), OHLCV tick-to-bar synthesis (528). LII/LIII (query engines,
+   queries this tranche). Queued from LIV: OHLCV
+   tick-to-bar synthesis (528). Gorilla XOR compression (522) landed
+   2026-11-21 as `omni_tick::gorilla` (software form). LII/LIII (query engines,
    HTAP) queue behind the store. XLIX (NVMe ZNS) queues behind
    real-metal NVMe.
 4. **Phase 3 refinement rungs** (K3/K4) — cursor machine formalized;
