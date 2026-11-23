@@ -1,5 +1,5 @@
 //! Gorilla-style XOR compression for u64 price streams (pillar LIV
-//! goal 522's software form): adjacent values are XORed with the
+//! goal 522's software form): adjacent values are `XORed` with the
 //! previous value; an unchanged value costs one bit, a changed one
 //! costs a control bit plus its meaningful payload. On realistic
 //! price drift (small deltas, shared high bits) this shrinks a u64

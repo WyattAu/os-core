@@ -2,6 +2,24 @@
 //! header validation, and hostile-extent rejection (REQ-OS-010).
 
 use omni_tick::{SegmentBuf, Tick, CRC_SIZE, HEADER_SIZE, TICK_SIZE};
+use proptest::prelude::*;
+
+/// Fails unless `Some`, returning the value (house assert+abort style).
+trait ExpectClean {
+    type Value;
+    fn expect_clean(self, what: &str) -> Self::Value;
+}
+
+impl<T> ExpectClean for Option<T> {
+    type Value = T;
+    fn expect_clean(self, what: &str) -> T {
+        assert!(self.is_some(), "{what}");
+        match self {
+            Some(v) => v,
+            None => std::process::abort(),
+        }
+    }
+}
 
 fn tick(i: u64) -> Tick {
     Tick {
@@ -222,4 +240,83 @@ fn range_query_binary_search_over_monotonic_segment() {
     assert!(seg.range(9900, 9999).next().is_none(), "beyond the data");
     // Full range returns everything.
     assert_eq!(seg.range(0, u64::MAX).count(), 8, "full range = replay");
+}
+
+// ---- Pillar LIV goal 528: tick-to-bar synthesis. ----
+
+use omni_tick::bars::BarAggregator;
+
+fn quote(ts: u64, bid: u64) -> Tick {
+    Tick {
+        ts_ns: ts,
+        instrument: 1,
+        flags: 0,
+        bid_px: bid,
+        ask_px: bid + 1,
+    }
+}
+
+#[test]
+fn bars_complete_at_epoch_crossings() {
+    // bucket 100 ns; ticks at 50, 150, 160, 300 → bars for epochs
+    // 0, 100, 300 (the 200-epoch has no ticks: no bar).
+    let mut agg = BarAggregator::new(100).expect_clean("nonzero bucket");
+    let feed = [quote(50, 10), quote(150, 12), quote(160, 11), quote(300, 9)];
+    let mut bars = Vec::new();
+    for q in &feed {
+        if let Some(b) = agg.push(q) {
+            bars.push(b);
+        }
+    }
+    assert_eq!(bars.len(), 2, "epochs 0 and 100 completed; 300 open");
+    let b0 = bars.first().expect_clean("epoch-0 bar");
+    assert_eq!(b0.epoch_start_ns, 0);
+    assert_eq!(b0.open, 10);
+    assert_eq!(b0.close, 10);
+    assert!(b0.bounds_hold(), "bounds invariant");
+    let b1 = bars.get(1).expect_clean("epoch-100 bar");
+    assert_eq!(b1.epoch_start_ns, 100);
+    assert_eq!(b1.open, 12);
+    assert_eq!(b1.high, 12);
+    assert_eq!(b1.low, 11);
+    assert_eq!(b1.close, 11);
+    assert_eq!(b1.volume, 2, "two ticks in epoch 100");
+}
+
+#[test]
+fn flush_emits_the_open_bar() {
+    let mut agg = BarAggregator::new(100).expect_clean("nonzero bucket");
+    assert!(agg.push(&quote(50, 10)).is_none(), "open bar is not done");
+    let flushed = agg.push(&quote(60, 11));
+    assert!(flushed.is_none(), "same epoch: still open");
+    let done = agg.flush().expect_clean("flush emits the open bar");
+    assert_eq!(done.epoch_start_ns, 0);
+    assert_eq!(done.open, 10);
+    assert_eq!(done.close, 11);
+    assert!(done.bounds_hold());
+    // The aggregator is empty afterwards.
+    assert!(agg.flush().is_none(), "flush on empty is None");
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// The bounds invariant survives ANY tick stream: whatever the
+    /// epoch layout, every emitted bar's prices stay inside its
+    /// [low, high].
+    #[test]
+    fn bar_bounds_hold_under_drift(
+        ts in proptest::collection::vec(0u64..1000, 0..40),
+        price in proptest::collection::vec(proptest::arbitrary::any::<u64>(), 0..40),
+    ) {
+        let mut agg = BarAggregator::new(50).expect_clean("nonzero bucket");
+        for (ts, price) in ts.into_iter().zip(price) {
+            if let Some(b) = agg.push(&quote(ts, price)) {
+                assert!(b.bounds_hold(), "bounds invariant per bar");
+            }
+        }
+        if let Some(b) = agg.flush() {
+            assert!(b.bounds_hold(), "flushed bar bounds");
+        }
+    }
 }
