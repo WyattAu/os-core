@@ -242,7 +242,7 @@ impl BlockDevice for NvmeSession {
 /// secondary bus. Bounded by depth against broken-hardware bus loops.
 /// Returns (bus, device, function) of the first NVMe (class 0x0108)
 /// found, or `None`.
-fn scan_bus_for_nvme(bus: u32, depth: usize) -> Option<(u32, u32, u32)> {
+pub fn scan_bus_for_class(bus: u32, depth: usize, want: u32) -> Option<(u32, u32, u32)> {
     if depth > 5 {
         return None;
     }
@@ -259,7 +259,7 @@ fn scan_bus_for_nvme(bus: u32, depth: usize) -> Option<(u32, u32, u32)> {
                 continue; // absent function
             }
             let fcc = (cfg32(bus, dev, base + 0x08) >> 16) & 0xFFFF;
-            if fcc == 0x0108 {
+            if fcc == want {
                 return Some((bus, dev, f));
             }
             let ftype = (cfg32(bus, dev, base + 0x0C) >> 16) & 0x7F;
@@ -268,7 +268,7 @@ fn scan_bus_for_nvme(bus: u32, depth: usize) -> Option<(u32, u32, u32)> {
                 // offset 0x19 (byte 2 of the dword at 0x18).
                 let sec = (cfg32(bus, dev, base + 0x18) >> 8) & 0xFF;
                 if sec > 0 {
-                    if let Some(found) = scan_bus_for_nvme(sec, depth + 1) {
+                    if let Some(found) = scan_bus_for_class(sec, depth + 1, want) {
                         return Some(found);
                     }
                 }
@@ -290,7 +290,7 @@ pub fn smoke(p: &NvmePages, hw: bool) -> Option<NvmeSession> {
     // a depth bound against broken-hardware bus loops.
     let mut bar = 0usize;
     let mut where_found = (0u32, 0u32, 0u32);
-    if let Some((b, d, f)) = scan_bus_for_nvme(0, 0) {
+    if let Some((b, d, f)) = scan_bus_for_class(0, 0, 0x0108) {
         bar = (cfg32(b, d + f, 0x10) & 0xFFFF_FFF0) as usize;
         where_found = (b, d, f);
     }
@@ -543,6 +543,8 @@ pub fn smoke(p: &NvmePages, hw: bool) -> Option<NvmeSession> {
         }
         uart.write_str("NVME READ CONSISTENT (hw)\n");
         uart.write_str("NVME WRITE SKIPPED (hw: live GPT)\n");
+        // The caller (kernel_main) records the markers into CMOS —
+        // this module owns NVMe, not the evidence channel.
         return Some(NvmeSession {
             bar,
             asq,

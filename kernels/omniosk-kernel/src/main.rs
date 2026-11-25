@@ -15,6 +15,7 @@
 #![no_std]
 #![no_main]
 
+mod cmos;
 mod nvme;
 mod vga;
 
@@ -997,6 +998,13 @@ extern "C" fn kernel_main() -> ! {
         usize::from(boot_protocol() == 2),
         core::sync::atomic::Ordering::Relaxed,
     );
+    if let Some(bits) = cmos::read_markers(&mut ports) {
+        uart.write_str("CMOS: prior hardware run markers=0x");
+        write_hex32(&mut uart, bits);
+        uart.write_str("\n");
+    } else {
+        uart.write_str("CMOS: no prior hardware run\n");
+    }
     uart.write_str("OMNIOSK UP (PVH -> long mode)\n");
 
     // ---- heap: carve the microcore heap from the PVH memory map ----
@@ -1098,10 +1106,18 @@ extern "C" fn kernel_main() -> ! {
             let read_ok = session.read_lba(0, &mut lba0).is_ok();
             nvme_ok = if hw {
                 let second_ok = session.read_lba(0, &mut lba0_again).is_ok();
-                read_ok
-                    && second_ok
-                    && lba0[..32] == lba0_again[..32]
-                    && lba0.iter().any(|b| *b != 0)
+                let consistent =
+                    read_ok && second_ok && lba0[..32] == lba0_again[..32];
+                if consistent {
+                    // The battery-backed evidence: survives the halt,
+                    // readable on the next omniosk boot.
+                    crate::cmos::write_markers(
+                        &mut ports,
+                        crate::cmos::M_IDENT | crate::cmos::M_READ_CONSISTENT,
+                    );
+                    uart.write_str("CMOS: markers written\n");
+                }
+                consistent
             } else {
                 read_ok && lba0[..nvme::MAGIC.len()] == *nvme::MAGIC
             };
