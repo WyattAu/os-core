@@ -13,7 +13,7 @@
 |---|---|---|---|
 | 0 | spec the vision | **met** (2026-11-09) | ADR-0009 + the corpus split |
 | 1 | omni-ring/omni-cap shipped; Lean gate green; Linux bypass spike | **met** (2026-11-20) | 11 published crate-versions (omni-ring 0.2, omni-cap, omni-heap, omni-task, omni-block, omni-sbe 0.1.1, omni-io, omni-tick 0.1/0.2, omni-md, omni-md-server); `make ci` carries the Lean gate (blocking) + Kani; A53 SQPOLL spike numbers |
-| 2 | tick-to-trade demo on one board; microcore boots QEMU -> hardware | **in progress** | QEMU boot: done, gate-enforced (blockcheck witness). Hardware boot: not started. Tick-to-trade: the data plane exists (omni-io -> omni-sbe -> omni-md -> omni-tick -> omni-md-server); no end-to-end demo run on a board yet |
+| 2 | tick-to-trade demo on one board; microcore boots QEMU -> hardware | **in progress** | QEMU boot: done, gate-enforced (blockcheck witness). Hardware boot: attempted 2026-11-25 (Lenovo i5-7400 via Limine->multiboot2, read-only smoke; verdict pending screen/CMOS reading). Tick-to-trade: the data plane exists (omni-io -> omni-sbe -> omni-md -> omni-tick -> omni-md-server); the software demo runs at 33 ns p50 (256 ticks, 169 trades); no board run yet |
 | 3 | microcore refinement proof; proof-carrying boot; DSL -> RTL | **rungs landed** | ADR-0014 ladder: mirrors + bitwise bridge + def-form theorems + cursor machine; Kani model-checking. The refinement proof proper (seL4-scale) remains the long pole |
 | 4 | integrated heterogeneous stack | not entered | K5/CXL-dependent |
 
