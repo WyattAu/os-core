@@ -63,3 +63,12 @@ price drift lives. Roundtrip proptest over arbitrary streams; drift
 streams compress below half raw. The FPGA single-cycle pipeline form
 (522's full claim) stays K5-gated; 528 (OHLCV bars) is the next
 software item in the LIV queue.
+
+**Update 2026-11-22 (528 landed):** `omni_tick::bars` — the OHLCV
+tick-to-bar synthesizer, goal 528's software form. Fixed-epoch
+buckets, the completed bar emitted at the epoch crossing, empty
+epochs emit nothing (facts, not interpolations), `flush` for
+end-of-stream. Reference price = `bid_px` (quote-tick convention,
+consistent with omni-md's strategy). The hardware DSP-pipeline form
+(528's full claim) stays K5-gated; the LIV software queue is now
+521-530 minus the FPGA/GPU forms.
