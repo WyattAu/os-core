@@ -237,34 +237,75 @@ impl BlockDevice for NvmeSession {
 /// Full device bring-up + smoke. Serial carries per-stage progress and the
 /// controller's model number. Returns the live session on success (the
 /// caller may then use `read_lba`/`write_lba`); None on any failure.
+/// Depth-first PCI enumeration: every function of every device on
+/// `bus`, recursing into PCI-to-PCI bridges (header type 1) via their
+/// secondary bus. Bounded by depth against broken-hardware bus loops.
+/// Returns (bus, device, function) of the first NVMe (class 0x0108)
+/// found, or `None`.
+fn scan_bus_for_nvme(bus: u32, depth: usize) -> Option<(u32, u32, u32)> {
+    if depth > 5 {
+        return None;
+    }
+    for dev in 0u32..32 {
+        let id = cfg32(bus, dev, 0x00);
+        if id == 0xFFFF_FFFF {
+            continue; // absent device
+        }
+        let multi = cfg32(bus, dev, 0x0C) & 0x0080_0000 != 0;
+        let funcs = if multi { 8 } else { 1 };
+        for f in 0..funcs {
+            let base = f * 0x800;
+            if cfg32(bus, dev, base) == 0xFFFF_FFFF {
+                continue; // absent function
+            }
+            let fcc = (cfg32(bus, dev, base + 0x08) >> 16) & 0xFFFF;
+            if fcc == 0x0108 {
+                return Some((bus, dev, f));
+            }
+            let ftype = (cfg32(bus, dev, base + 0x0C) >> 16) & 0x7F;
+            if ftype == 1 {
+                // PCI-to-PCI bridge: the secondary bus rides config
+                // offset 0x19 (byte 2 of the dword at 0x18).
+                let sec = (cfg32(bus, dev, base + 0x18) >> 8) & 0xFF;
+                if sec > 0 {
+                    if let Some(found) = scan_bus_for_nvme(sec, depth + 1) {
+                        return Some(found);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 pub fn smoke(p: &NvmePages, hw: bool) -> Option<NvmeSession> {
     let mut uart = Serial::new(RawPorts, COM1);
 
-    // ---- PCI: find the NVMe on bus 0 ----
+    // ---- PCI: find the NVMe by class code, across all buses ----
     // Match by CLASS CODE (0x0108 NVMe, mass-storage base 0x01), not by
     // vendor/device: the hardware target's controller is a WDC SN720
     // (vendor 0x15B7), and the QEMU vendor constants mean nothing on
-    // real silicon. Absent devices read 0xFFFF (skip); QEMU's emulated
-    // NVMe carries the same class code as real ones.
+    // real silicon. The walk recurses through PCI-to-PCI bridges (a
+    // modern board hangs the NVMe and the NIC behind root ports), with
+    // a depth bound against broken-hardware bus loops.
     let mut bar = 0usize;
-    let mut found_fn = None;
-    for dev in 0u32..32 {
-        let id = cfg32(0, dev, 0x00);
-        if id == 0xFFFF_FFFF {
-            continue; // absent device/function
-        }
-        let cc = cfg32(0, dev, 0x08);
-        if (cc >> 16) & 0xFFFF == 0x0108 {
-            bar = (cfg32(0, dev, 0x10) & 0xFFFF_FFF0) as usize;
-            found_fn = Some(dev);
-            break;
-        }
+    let mut where_found = (0u32, 0u32, 0u32);
+    if let Some((b, d, f)) = scan_bus_for_nvme(0, 0) {
+        bar = (cfg32(b, d + f, 0x10) & 0xFFFF_FFF0) as usize;
+        where_found = (b, d, f);
     }
     if bar == 0 {
-        uart.write_str("NVME: device not found (class 0x0108 scan, bus 0)\n");
+        uart.write_str("NVME: device not found (class 0x0108 scan)\n");
         return None;
     }
-    let _ = found_fn;
+    uart.write_str("NVME: found at bus/dev/fn ");
+    write_hex(&mut uart, where_found.0);
+    uart.write_byte(b'/');
+    write_hex(&mut uart, where_found.1);
+    uart.write_byte(b'/');
+    write_hex(&mut uart, where_found.2);
+    uart.write_str("\n");
+    let _ = where_found;
 
     // Doorbell stride = 4 bytes (SeaBIOS-verified: CQ0HDBL @ 0x1004).
     // The CAP[2:0] read of 0x7 does not reflect the effective stride
