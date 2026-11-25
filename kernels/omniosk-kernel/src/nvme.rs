@@ -11,9 +11,6 @@
 
 use omniosk::serial::{PortIo, Serial, COM1};
 
-const PCI_NVME_VENDOR: u16 = 0x1B36;
-const PCI_NVME_DEVICE: u16 = 0x0010;
-
 /// Page-aligned scratch: admin queues, identify data, I/O queues, read data.
 #[repr(C, align(4096))]
 /// The six DMA pages the smoke needs, supplied by the caller (the
@@ -243,21 +240,31 @@ impl BlockDevice for NvmeSession {
 pub fn smoke(p: &NvmePages) -> Option<NvmeSession> {
     let mut uart = Serial::new(RawPorts, COM1);
 
-    // ---- PCI: find the QEMU NVMe on bus 0 ----
+    // ---- PCI: find the NVMe on bus 0 ----
+    // Match by CLASS CODE (0x0108 NVMe, mass-storage base 0x01), not by
+    // vendor/device: the hardware target's controller is a WDC SN720
+    // (vendor 0x15B7), and the QEMU vendor constants mean nothing on
+    // real silicon. Absent devices read 0xFFFF (skip); QEMU's emulated
+    // NVMe carries the same class code as real ones.
     let mut bar = 0usize;
+    let mut found_fn = None;
     for dev in 0u32..32 {
         let id = cfg32(0, dev, 0x00);
-        if (id & 0xFFFF) == u32::from(PCI_NVME_VENDOR)
-            && ((id >> 16) & 0xFFFF) == u32::from(PCI_NVME_DEVICE)
-        {
+        if id == 0xFFFF_FFFF {
+            continue; // absent device/function
+        }
+        let cc = cfg32(0, dev, 0x08);
+        if (cc >> 16) & 0xFFFF == 0x0108 {
             bar = (cfg32(0, dev, 0x10) & 0xFFFF_FFF0) as usize;
+            found_fn = Some(dev);
             break;
         }
     }
     if bar == 0 {
-        uart.write_str("NVME: device not found\n");
+        uart.write_str("NVME: device not found (class 0x0108 scan, bus 0)\n");
         return None;
     }
+    let _ = found_fn;
 
     // Doorbell stride = 4 bytes (SeaBIOS-verified: CQ0HDBL @ 0x1004).
     // The CAP[2:0] read of 0x7 does not reflect the effective stride
@@ -547,6 +554,11 @@ struct RawPorts;
 
 impl PortIo for RawPorts {
     fn out(&mut self, port: u16, value: u8) {
+        // The VGA mirror (main.rs's RawPorts does the same): COM1's
+        // data port is the console byte stream.
+        if port == COM1 && value != 0 {
+            crate::vga::vga_write_byte(value);
+        }
         // SAFETY: kernel-only module; see main.rs.
         unsafe {
             core::arch::asm!("out dx, al", in("dx") port, in("al") value);

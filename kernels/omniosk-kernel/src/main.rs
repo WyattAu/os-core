@@ -16,6 +16,7 @@
 #![no_main]
 
 mod nvme;
+mod vga;
 
 use core::arch::global_asm;
 use core::panic::PanicInfo;
@@ -38,6 +39,34 @@ global_asm! {
         .asciz "Xen"
         .long _start
 
+    /* Multiboot2 header (GRUB/ISO boot path): must live within the
+       first 32 KiB of the file and be 64-bit aligned. We ask for the
+       memory map (MBI tag 6) via the information-request tag, and the
+       entry-address tag routes GRUB to the same 32-bit entry the PVH
+       path uses (EAX = 0x36D76289, EBX = &MBI). */
+    .section .multiboot, "a"
+    .align 8
+    mb2_header:
+        .long 0xE85250D6                    /* magic */
+        .long 0                             /* arch: i386 */
+        .long mb2_header_end - mb2_header   /* header length */
+        .long -(0xE85250D6 + mb2_header_end - mb2_header) /* checksum */
+        /* information request tag: the memory map */
+        .short 1                            /* type */
+        .short 0                            /* flags */
+        .long 12                            /* size */
+        .long 6                             /* MBI tag 6: memory map */
+        /* entry address tag */
+        .short 3
+        .short 0
+        .long 12
+        .long _start
+        /* end tag */
+        .short 0
+        .short 0
+        .long 8
+    mb2_header_end:
+
     /* PVH handoff pointer: ESI at the 32-bit entry = &hvm_start_info
        (Xen PVH abi; QEMU fills it with the e820-style memory map).
        Saved into .data — NOT .bss, which the trampoline zeroes after
@@ -46,6 +75,13 @@ global_asm! {
     .align 4
     .global pvh_info_ptr
     pvh_info_ptr:
+        .long 0
+
+    /* which boot protocol handed off: 1 = PVH, 2 = multiboot2 */
+    .section .data.bootkind, "aw"
+    .align 4
+    .global boot_kind
+    boot_kind:
         .long 0
 
     /* identity page tables: pml4[0] -> pdpt[0] -> pd (512 * 2 MiB = 1 GiB) */
@@ -94,8 +130,19 @@ global_asm! {
     _start:
         cli
         cld
-        /* save the PVH handoff pointer before anything clobbers ESI */
-        mov [pvh_info_ptr], esi
+        /* boot-protocol branch: MB2 hand-off is EAX=0x36D76289 with
+           EBX=&MBI; PVH hand-off is ESI=&hvm_start_info (EAX is
+           garbage). Save both the pointer and which protocol won. */
+        cmp eax, 0x36D76289
+        je .multiboot2
+        mov [pvh_info_ptr], esi         /* PVH: ESI = &hvm_start_info */
+        mov eax, 1                      /* 1 = PVH (QEMU -kernel) */
+        jmp .set_kind
+    .multiboot2:
+        mov eax, 2                      /* 2 = multiboot2 (GRUB) */
+    .set_kind:
+        mov [boot_kind], eax            /* EAX width sizes the store */
+    .entered:
         mov esp, OFFSET boot_stack_bottom
         add esp, 0x4000          /* top of the 16 KiB boot stack */
 
@@ -261,8 +308,20 @@ extern "C" {
     /// Written by the trampoline: ESI at the PVH 32-bit entry, i.e. the
     /// physical address of the `hvm_start_info` struct.
     static pvh_info_ptr: u32;
+    /// Written by the trampoline at the 32-bit entry: which boot
+    /// protocol handed off. 1 = PVH (QEMU `-kernel`, exits via
+    /// isa-debug-exit), 2 = multiboot2 (GRUB/ISO, halts — the smoke
+    /// gate watches the serial log instead of the exit code).
+    static boot_kind: u32;
     /// Linker-script symbol (kern.ld): end of the kernel image.
     static __bss_end: u8;
+}
+
+/// Which boot protocol brought us up (read once at boot).
+fn boot_protocol() -> u32 {
+    // SAFETY: written by the trampoline before any Rust runs; never
+    // mutated afterwards.
+    unsafe { core::ptr::addr_of!(boot_kind).read_volatile() }
 }
 
 /// Bitmap backing for the microcore heap: 512 words -> 32,768 pages
@@ -846,6 +905,12 @@ struct RawPorts;
 
 impl PortIo for RawPorts {
     fn out(&mut self, port: u16, value: u8) {
+        // The VGA mirror: COM1's data port is the console byte
+        // stream; the screen shows it where no UART exists (the
+        // hardware target has no 16550).
+        if port == COM1 && value != 0 {
+            vga::vga_write_byte(value);
+        }
         // SAFETY: kernel-only module; COM1 and the debug-exit port are
         // unclaimed by anything else on this machine by construction.
         unsafe {
@@ -886,7 +951,24 @@ fn panic(info: &PanicInfo) -> ! {
         uart.write_str(core::str::from_utf8(&buf[end..]).unwrap_or("?"));
         uart.write_str("\n");
     }
-    qemu_exit(&mut ports, 33)
+    machine_exit(&mut ports, &mut uart, 33)
+}
+
+/// Terminal exit, per boot protocol: the QEMU path (`boot_kind` 1)
+/// leaves through isa-debug-exit and the smoke reads the exit code;
+/// the multiboot2 path (GRUB/ISO, real firmware) has no exit device —
+/// it prints the halt line and stops, and the gate reads the serial
+/// log instead of the exit code.
+fn machine_exit(ports: &mut RawPorts, uart: &mut Serial<RawPorts>, code: u8) -> ! {
+    if boot_protocol() == 1 {
+        qemu_exit(ports, code);
+    }
+    uart.write_str("HALT (multiboot2 boot; power-cycle or kexec back)\n");
+    loop {
+        // SAFETY: hlt with the PIT still ticking — the machine stays
+        // observable; nothing further runs.
+        unsafe { core::arch::asm!("hlt"); }
+    }
 }
 
 /// `#[no_mangle]`: the boot trampoline calls this exact symbol.
@@ -904,7 +986,7 @@ extern "C" fn kernel_main() -> ! {
         uart.write_str("NVME FAIL\n"); // NVMe DMA pages come from the heap
         uart.write_str("RING SMOKE PASS\n");
         uart.write_str("HALT (idle, 1 kHz tick)\n");
-        qemu_exit(&mut ports, 34);
+        machine_exit(&mut ports, &mut uart, 34);
     };
     uart.write_str("HEAP PASS\n");
 
@@ -924,7 +1006,7 @@ extern "C" fn kernel_main() -> ! {
 
     if failed {
         uart.write_str("RING SMOKE FAIL\n");
-        qemu_exit(&mut ports, 33);
+        machine_exit(&mut ports, &mut uart, 33);
     }
 
     // Phase 2: wraparound. The cursors cross the slot-mask boundary
@@ -943,7 +1025,7 @@ extern "C" fn kernel_main() -> ! {
     }
     if !wrapped {
         uart.write_str("RING WRAP FAIL\n");
-        qemu_exit(&mut ports, 33);
+        machine_exit(&mut ports, &mut uart, 33);
     }
     uart.write_str("RING WRAP PASS\n");
 
@@ -1153,5 +1235,5 @@ extern "C" fn kernel_main() -> ! {
     // success marker unconditionally so the QEMU smoke gate is clean.
     uart.write_str("RING SMOKE PASS\n");
     uart.write_str("HALT (idle, 1 kHz tick)\n");
-    qemu_exit(&mut ports, 31)
+    machine_exit(&mut ports, &mut uart, 31)
 }
