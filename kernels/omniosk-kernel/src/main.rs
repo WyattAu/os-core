@@ -1005,7 +1005,11 @@ extern "C" fn kernel_main() -> ! {
     } else {
         uart.write_str("CMOS: no prior hardware run\n");
     }
-    uart.write_str("OMNIOSK UP (PVH -> long mode)\n");
+    uart.write_str(if boot_protocol() == 2 {
+        "OMNIOSK UP (multiboot2 -> long mode)\n"
+    } else {
+        "OMNIOSK UP (PVH -> long mode)\n"
+    });
 
     // ---- heap: carve the microcore heap from the PVH memory map ----
     // (REQ-OS-007; REQ-OS-005 boot-protocol seam). See heap_init below.
