@@ -237,7 +237,7 @@ impl BlockDevice for NvmeSession {
 /// Full device bring-up + smoke. Serial carries per-stage progress and the
 /// controller's model number. Returns the live session on success (the
 /// caller may then use `read_lba`/`write_lba`); None on any failure.
-pub fn smoke(p: &NvmePages) -> Option<NvmeSession> {
+pub fn smoke(p: &NvmePages, hw: bool) -> Option<NvmeSession> {
     let mut uart = Serial::new(RawPorts, COM1);
 
     // ---- PCI: find the NVMe on bus 0 ----
@@ -462,6 +462,59 @@ pub fn smoke(p: &NvmePages) -> Option<NvmeSession> {
         write_hex(&mut uart, dw3);
         uart.write_str("\n");
         return None;
+    }
+
+    if hw {
+        // Hardware mode: the disk carries a live GPT/filesystem, so the
+        // magic compare and the write test are both unsafe here. The
+        // read-consistency check IS the silicon claim: a second read
+        // (slot 1) must match the first byte-for-byte.
+        let mut first = [0u8; 16];
+        for (i, b) in first.iter_mut().enumerate() {
+            *b = vbyte(readb, i);
+        }
+        let mut sqe = [0u8; 64];
+        sqe[0] = 0x02; // Read
+        sqe[2..4].copy_from_slice(&7u16.to_le_bytes()); // CID 7
+        sqe[4..8].copy_from_slice(&1u32.to_le_bytes()); // NSID 1
+        sqe[24..32].copy_from_slice(&(readb as u64).to_le_bytes()); // PRP1
+        sqe[40..44].copy_from_slice(&0u32.to_le_bytes()); // CDW10: SLBA = 0
+        sqe[48..52].copy_from_slice(&0u32.to_le_bytes()); // CDW12: NLB-1 = 0
+        submit(bar, iosq, 1, sq_db_off(1, stride), &sqe);
+        let dw3 = match wait_cqe(bar, iocq, 1, 1, cq_hd_off(1, stride), IO_QSIZE) {
+            Some(v) => v,
+            None => {
+                uart.write_str("NVME: consistency-read timeout\n");
+                return None;
+            }
+        };
+        if (dw3 >> 17 & 0x7FFF) != 0 {
+            uart.write_str("NVME: consistency-read status=0x");
+            write_hex(&mut uart, dw3);
+            uart.write_str("\n");
+            return None;
+        }
+        for (i, b) in first.iter().enumerate() {
+            if vbyte(readb, i) != *b {
+                uart.write_str("NVME: read not consistent\n");
+                return None;
+            }
+        }
+        uart.write_str("NVME READ CONSISTENT (hw)\n");
+        uart.write_str("NVME WRITE SKIPPED (hw: live GPT)\n");
+        return Some(NvmeSession {
+            bar,
+            asq,
+            acq,
+            iosq,
+            iocq,
+            readb,
+            lbas: nsze,
+            stride,
+            iosq_tail: 2, // slots 0..1 consumed by the two reads
+            cqe_idx: 2,
+            cqe_phase: 1,
+        });
     }
 
     for (i, expected) in MAGIC.iter().enumerate() {

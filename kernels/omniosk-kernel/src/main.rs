@@ -718,6 +718,13 @@ static mut SCHED: Option<Scheduler<4>> = None;
 /// after the smoke (the omni-block seam, task-consumed).
 static mut NVME_SESSION: Option<nvme::NvmeSession> = None;
 
+/// 1 = booted on real hardware (multiboot2/GRUB): the NVMe smoke and
+/// the blockcheck task validate by read-consistency, not by the magic
+/// pattern (the disk carries a live GPT/filesystem). Set once by
+/// kernel_main before any task dispatch.
+static BOOT_HW: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
 /// Blockcheck witnesses: 3 successful LBA-0 reads through the
 /// `BlockDevice` trait with zero failures = TASK PASS contribution.
 static BLOCKCHECK_OK: core::sync::atomic::AtomicUsize =
@@ -777,9 +784,18 @@ fn task_blockcheck(ctx: &mut TaskCtx) -> TaskFlow {
         return TaskFlow::Done;
     };
     let mut buf = [0u8; 512];
+    let mut buf2 = [0u8; 512];
     let read = s.read_lba(0, &mut buf);
-    let magic_ok = read.is_ok() && buf[..nvme::MAGIC.len()] == *nvme::MAGIC;
-    let ok = read.is_ok() && magic_ok;
+    let hw = BOOT_HW.load(core::sync::atomic::Ordering::Relaxed) == 1;
+    let ok = if hw {
+        let second = s.read_lba(0, &mut buf2);
+        read.is_ok()
+            && second.is_ok()
+            && buf[..32] == buf2[..32]
+            && buf.iter().any(|b| *b != 0)
+    } else {
+        read.is_ok() && buf[..nvme::MAGIC.len()] == *nvme::MAGIC
+    };
     if !ok {
         // Fail-path probe: the raw CQE dword for the slot the session
         // poll was waiting on. Phase bit = DW3 bit 16, SF = DW3[30:17],
@@ -977,6 +993,10 @@ extern "C" fn kernel_main() -> ! {
     let mut ports = RawPorts;
     let mut uart = Serial::new(RawPorts, COM1);
     uart.init(1);
+    BOOT_HW.store(
+        usize::from(boot_protocol() == 2),
+        core::sync::atomic::Ordering::Relaxed,
+    );
     uart.write_str("OMNIOSK UP (PVH -> long mode)\n");
 
     // ---- heap: carve the microcore heap from the PVH memory map ----
@@ -1061,18 +1081,30 @@ extern "C" fn kernel_main() -> ! {
             iosq: pages[4],
             iocq: pages[5],
         };
-        let mut nvme_session = nvme::smoke(&nvme_pages);
+        // multiboot2 boot == real hardware: the disk carries a live
+        // GPT, so the smoke validates read-consistency and skips the
+        // write test (no safe scratch on a live filesystem).
+        let hw = boot_protocol() == 2;
+        let mut nvme_session = nvme::smoke(&nvme_pages, hw);
         let mut nvme_ok = nvme_session.is_some();
         if let Some(session) = nvme_session.as_mut() {
             // The retained session implements omni_block::BlockDevice —
-            // the seam surface: re-read LBA 0 through the trait and
-            // re-verify the magic.
+            // the seam surface: re-read LBA 0 through the trait.
+            // QEMU: the magic must be present. Hardware: two reads of
+            // the same LBA must agree (consistency, not content).
             use omni_block::BlockDevice;
             let mut lba0 = [0u8; 512];
-            nvme_ok = session
-                .read_lba(0, &mut lba0)
-                .is_ok()
-                && lba0[..nvme::MAGIC.len()] == *nvme::MAGIC;
+            let mut lba0_again = [0u8; 512];
+            let read_ok = session.read_lba(0, &mut lba0).is_ok();
+            nvme_ok = if hw {
+                let second_ok = session.read_lba(0, &mut lba0_again).is_ok();
+                read_ok
+                    && second_ok
+                    && lba0[..32] == lba0_again[..32]
+                    && lba0.iter().any(|b| *b != 0)
+            } else {
+                read_ok && lba0[..nvme::MAGIC.len()] == *nvme::MAGIC
+            };
         }
         if nvme_ok {
             uart.write_str("NVME READ PASS\n");
