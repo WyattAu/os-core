@@ -201,6 +201,53 @@ fn io_write_lba(s: &mut NvmeSession, lba: u64) -> bool {
 
 use omni_block::{wire, BlockDevice, BlockError};
 
+impl NvmeSession {
+    /// Reads the OTA update header from LBA 34 and validates it.
+    /// Returns the staged ELF size when an update is present.
+    /// The read is safe on any disk (live GPT included — the header
+    /// LBA sits in the alignment gap no filesystem owns).
+    pub fn check_update(&mut self) -> Option<u32> {
+        let mut hdr = [0u8; 512];
+        let read = self.read_lba(update_channel::HEADER_LBA, &mut hdr);
+        if read.is_err() {
+            return None;
+        }
+        let magic = u32::from_le_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]);
+        let size = u32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]);
+        if magic != update_channel::MAGIC {
+            return None;
+        }
+        if size == 0 || size > update_channel::MAX_SIZE {
+            return None;
+        }
+        Some(size)
+    }
+
+    /// Reads `lbas` consecutive LBAs starting at `start` into `dst`
+    /// (which must be `lbas * 512` bytes). One LBA per trait read,
+    /// copied out of the session's DMA page per iteration.
+    /// Returns false on the first failing read.
+    pub fn read_lbas_into(&mut self, start: u64, lbas: u32, dst: *mut u8) -> bool {
+        let mut buf = [0u8; 512];
+        for i in 0..lbas {
+            let lba = start + u64::from(i);
+            if self.read_lba(lba, &mut buf).is_err() {
+                return false;
+            }
+            // SAFETY: the caller sized dst for `lbas` LBAs; the copy
+            // stays inside it.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    buf.as_ptr(),
+                    dst.add(i as usize * 512),
+                    512,
+                );
+            }
+        }
+        true
+    }
+}
+
 /// The `omni-block` contract over the NVMe I/O queues (REQ layer).
 impl BlockDevice for NvmeSession {
     fn capacity_lbas(&self) -> u64 {
@@ -687,4 +734,18 @@ impl RawPorts {
         }
         value
     }
+}
+
+/// The OTA update channel: reserved LBAs 34+ in the GPT-to-first-
+/// partition alignment gap (nothing owns them; reads are always safe,
+/// writes land only in this gap — never LBA 0/1). See docs/OTA-UPDATE.md.
+pub mod update_channel {
+    /// The update header LBA: magic `OMUP` u32 + the ELF size u32.
+    pub const HEADER_LBA: u64 = 34;
+    /// The ELF file bytes start at this LBA, contiguous.
+    pub const DATA_LBA: u64 = 35;
+    /// The header magic, little-endian on the wire.
+    pub const MAGIC: u32 = 0x5055_4D4F; // "OMUP" LE
+    /// The maximum accepted update size (512 KiB).
+    pub const MAX_SIZE: u32 = 512 * 1024;
 }
