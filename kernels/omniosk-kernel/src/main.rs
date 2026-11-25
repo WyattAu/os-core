@@ -79,7 +79,8 @@ global_asm! {
     pvh_info_ptr:
         .long 0
 
-    /* which boot protocol handed off: 1 = PVH, 2 = multiboot2 */
+    /* which boot protocol handed off: 1 = PVH, 2 = multiboot2,
+       3 = OTA update (trampoline, EAX = UPDA, no protocol struct) */
     .section .data.bootkind, "aw"
     .align 4
     .global boot_kind
@@ -100,8 +101,11 @@ global_asm! {
         .quad 0                       /* null */
         .quad 0x00AF9A000000FFFF      /* 64-bit code (L=1, D=0, G=1) */
         .quad 0x00CF92000000FFFF      /* data */
+        .quad 0x00CF9A000000FFFF      /* 32-bit code (L=0, D=1, G=1) —
+                                         selector 0x18, the OTA
+                                         trampoline's compat target */
     gdtdesc:
-        .word 23
+        .word 31
         .long gdt
         .word 0
 
@@ -137,11 +141,18 @@ global_asm! {
            garbage). Save both the pointer and which protocol won. */
         cmp eax, 0x36D76289
         je .multiboot2
+        cmp eax, 0x55504441
+        je .ota_update
         mov [pvh_info_ptr], esi         /* PVH: ESI = &hvm_start_info */
         mov eax, 1                      /* 1 = PVH (QEMU -kernel) */
         jmp .set_kind
     .multiboot2:
         mov eax, 2                      /* 2 = multiboot2 (GRUB) */
+        jmp .set_kind
+    .ota_update:
+        mov eax, 3                      /* 3 = OTA update handoff — the
+                                           trampoline's UPDA magic; no
+                                           protocol struct exists */
     .set_kind:
         mov [boot_kind], eax            /* EAX width sizes the store */
     .entered:
@@ -156,9 +167,13 @@ global_asm! {
         mov cr3, eax            /* flush TLB; CR3 refilled below */
 
         /* zero .bss: the PVH loader does not clear it, and garbage here
-           reads back as phantom completions and stale DMA buffers */
+           reads back as phantom completions and stale DMA buffers.
+           OFFSET is required: a bare symbol assembles as a memory LOAD
+           (relocated to the symbol's VALUE as the address — the count
+           then comes from video-RAM garbage at 0xa154), not an
+           immediate. Found by the OTA gate's boot-2 regression. */
         mov edi, OFFSET __bss_start
-        mov ecx, __bss_size
+        mov ecx, OFFSET __bss_size
         xor eax, eax
         rep stosd
 
@@ -981,7 +996,10 @@ fn machine_exit(ports: &mut RawPorts, uart: &mut Serial<RawPorts>, code: u8) -> 
     if boot_protocol() == 1 {
         qemu_exit(ports, code);
     }
-    uart.write_str("HALT (multiboot2 boot; power-cycle or kexec back)\n");
+    uart.write_str(match boot_protocol() {
+        3 => "HALT (update boot; power-cycle reloads the prior kernel)\n",
+        _ => "HALT (multiboot2 boot; power-cycle or kexec back)\n",
+    });
     loop {
         // SAFETY: hlt with the PIT still ticking — the machine stays
         // observable; nothing further runs.
@@ -1004,10 +1022,13 @@ const TRAMPOLINE: usize = 0x0180_0000;
 const UPDATE_MAGIC: u32 = 0x5550_4441; // "UPDA"
 /// The maximum staged ELF size (512 KiB).
 const MAX_UPDATE: usize = 512 * 1024;
-/// The segment table offset within the trampoline page (past the
-/// 0x38-byte code block).
-const TABLE_OFF: usize = 0x40;
-/// The maximum segment triples the table holds.
+/// The segment table offset within the trampoline page: past the
+/// 0x56-byte code block, aligned. Entries are 16 bytes.
+const TABLE_OFF: usize = 0x60;
+/// The far-jump operand slot within the trampoline page (past the
+/// 8-entry table at 0x60..0xE0, within the 4 KiB page).
+const FWORD_OFF: usize = 0xF0;
+/// The maximum segment entries the table holds (8 × 16 = 0x80 bytes).
 const MAX_SEGS: usize = 8;
 
 /// Validates the staged ELF64 header (magic, 64-bit, LE, x86-64).
@@ -1048,123 +1069,187 @@ unsafe fn rd16(image: *const u8, off: usize) -> u16 {
     unsafe { core::ptr::read_volatile(image.add(off).cast::<u16>()) }
 }
 
-/// T4b: loads the staged ELF and drops to the trampoline.
+/// ELF64 layout sanity for the OTA path: the program-header table is
+/// the canonical size, bounded by the table, inside the staged bytes,
+/// and the entry point is nonzero. The emission strides program
+/// headers at exactly 56 bytes, so `e_phentsize` must be 56.
 ///
-/// Parses the ELF64 program headers into a segment table at
-/// `tramp + 0x40`, writes the hand-assembled compat-drop code at
-/// `tramp`, then far-jumps through the GDT's 32-bit code segment.
-/// The trampoline copies each PT_LOAD segment to its `p_paddr`,
-/// clears paging, and enters the new kernel's 32-bit entry with
-/// EAX = [`UPDATE_MAGIC`].
-///
-/// SAFETY: `image` is the validated staged ELF at `STAGING` with at
-/// least `size` bytes readable; `tramp` is the fixed 24 MiB scratch
-/// page; the GDT carries the 32-bit code segment at selector 0x18.
-unsafe fn load_and_jump(image: *const u8, size: usize, tramp: *mut u8) -> ! {
-    // SAFETY: the staged image bounds were validated by the caller
-    // (size <= MAX_UPDATE, read from the disk into the staging).
+/// SAFETY: `image` holds `size` readable bytes in the identity map.
+unsafe fn elf_loadable(image: *const u8, size: usize) -> bool {
+    // SAFETY: fixed low offsets into the staged image.
     unsafe {
         let e_entry = rd64(image, 0x18) as usize;
         let e_phoff = rd64(image, 0x20) as usize;
         let e_phentsize = usize::from(rd16(image, 0x36));
         let e_phnum = usize::from(rd16(image, 0x38));
+        e_entry != 0
+            && e_phentsize == 56
+            && e_phnum > 0
+            && e_phnum <= MAX_SEGS
+            && e_phoff + e_phnum * 56 <= size
+    }
+}
 
-        // Parse the program headers into the segment table at
-        // tramp + 0x40. Each PT_LOAD: (dst = p_paddr, src = STAGING
-        // + p_offset, len = p_filesz). Bounded by MAX_SEGS.
+/// Walks the staged ELF's PT_LOAD program headers into the trampoline
+/// segment table: 16-byte entries of (dst, src, filesz, memsz) u32s
+/// at `tramp + TABLE_OFF`. Returns (count, entry), or None when any
+/// segment would read or write outside its bounds — the caller then
+/// boots normally instead of jumping.
+///
+/// SAFETY: `image` holds `size` readable bytes in the identity map;
+/// `tramp` is the fixed 4 KiB scratch page.
+unsafe fn build_segment_table(
+    image: *const u8,
+    size: usize,
+    tramp: *mut u8,
+) -> Option<(usize, usize)> {
+    // SAFETY: the layout was validated by `elf_loadable` (phentsize
+    // 56, phnum <= MAX_SEGS, table inside the staged bytes).
+    unsafe {
+        let e_entry = rd64(image, 0x18) as usize;
+        let e_phoff = rd64(image, 0x20) as usize;
+        let e_phnum = usize::from(rd16(image, 0x38));
         let table = tramp.add(TABLE_OFF);
         let mut count = 0usize;
         for i in 0..e_phnum {
             let ph = image.add(e_phoff + i * 56);
             let p_type = rd32(ph, 0);
             if p_type != 1 {
-                continue; // not PT_LOAD
+                continue; // PT_LOAD only
             }
             let p_offset = rd32(ph, 8) as usize;
             let p_paddr = rd32(ph, 24) as usize;
             let p_filesz = rd32(ph, 32) as usize;
-            let dst = table.add(count * 12);
-            core::ptr::write_volatile(dst.cast::<u32>(), p_paddr as u32);
+            let p_memsz = rd32(ph, 40) as usize;
+            // The file bytes must sit inside the staged image, the
+            // memory image cannot be smaller than the file image, and
+            // neither segment may overlap the trampoline page or the
+            // staging region itself (the kernel loads at 16 MiB; this
+            // guards a malformed image from clobbering the loader).
+            if p_offset + p_filesz > size
+                || p_memsz < p_filesz
+                || overlaps(p_paddr, p_memsz, TRAMPOLINE, 0x1000)
+                || overlaps(p_paddr, p_memsz, STAGING, size)
+            {
+                return None;
+            }
+            let slot = table.add(count * 16);
+            // SAFETY: 16 bytes per slot; MAX_SEGS slots fit the table.
+            core::ptr::write_volatile(slot.cast::<u32>(), p_paddr as u32);
             core::ptr::write_volatile(
-                dst.add(4).cast::<u32>(),
+                slot.add(4).cast::<u32>(),
                 (STAGING + p_offset) as u32,
             );
-            core::ptr::write_volatile(dst.add(8).cast::<u32>(), p_filesz as u32);
+            core::ptr::write_volatile(slot.add(8).cast::<u32>(), p_filesz as u32);
+            core::ptr::write_volatile(slot.add(12).cast::<u32>(), p_memsz as u32);
             count += 1;
-            if count >= MAX_SEGS {
-                break;
-            }
         }
+        if count == 0 {
+            return None;
+        }
+        Some((count, e_entry))
+    }
+}
 
-        // The trampoline: 32-bit flat code entered via the far-jump
-        // from long mode. Clearing PG drops to physical addressing;
-        // the seg_loop copies each table entry; the tail jumps to the
-        // new entry with EAX = UPDATE_MAGIC for the boot protocol
-        // branch.
-        let mut tr: [u8; 0x40] = [0; 0x40];
-        // 0x00: mov eax, cr0
-        tr[0x00] = 0x0F; tr[0x01] = 0x20; tr[0x02] = 0xC0;
-        // 0x03: and eax, 0x7FFFFFFF
-        tr[0x03] = 0x25;
-        tr[0x04..0x08].copy_from_slice(&0x7FFF_FFFFu32.to_le_bytes());
-        // 0x08: mov cr0, eax
-        tr[0x08] = 0x0F; tr[0x09] = 0x22; tr[0x0A] = 0xC0;
-        // 0x0B: xor eax, eax
-        tr[0x0B] = 0x31; tr[0x0C] = 0xC0;
-        // 0x0D: mov cr3, eax
-        tr[0x0D] = 0x0F; tr[0x0E] = 0x22; tr[0x0F] = 0xD8;
-        // 0x10: mov ebx, table (the table lives right after the code)
-        tr[0x10] = 0xBB;
-        tr[0x11..0x15].copy_from_slice(&((tramp as usize + TABLE_OFF) as u32).to_le_bytes());
-        // 0x15: mov ecx, count (the segment count, patched at 0x16)
-        tr[0x15] = 0xB9;
-        tr[0x16..0x1A].copy_from_slice(&(count as u32).to_le_bytes());
-        // 0x1A: seg_loop
-        // 0x1A: push ecx
-        tr[0x1A] = 0x51;
-        // 0x1B: mov edi, [ebx]
-        tr[0x1B] = 0x8B; tr[0x1C] = 0x3B;
-        // 0x1D: mov esi, [ebx+4]
-        tr[0x1D] = 0x8B; tr[0x1E] = 0x73; tr[0x1F] = 0x04;
-        // 0x20: shr ecx, 2
-        tr[0x20] = 0xC1; tr[0x21] = 0xE9; tr[0x22] = 0x02;
-        // 0x23: add ebx, 12
-        tr[0x23] = 0x83; tr[0x24] = 0xC3; tr[0x25] = 0x0C;
-        // 0x26: rep movsd
-        tr[0x26] = 0xF3; tr[0x27] = 0xA5;
-        // 0x28: pop ecx
-        tr[0x28] = 0x59;
-        // 0x29: test ecx, ecx
-        tr[0x29] = 0x85; tr[0x2A] = 0xC9;
-        // 0x2B: jz entry_load (rel8 = 0x33 - 0x2D = +6)
-        tr[0x2B] = 0x74; tr[0x2C] = 0x06;
-        // 0x2D: jmp seg_loop (rel8 = 0x1A - 0x2F = -0x15)
-        tr[0x2D] = 0xEB; tr[0x2E] = 0x15;
-        // 0x2F: (exit — the count is exhausted; fall through to the
-        // entry load)
-        // 0x2F: mov eax, UPDATE_MAGIC
-        tr[0x2F] = 0xB8;
-        tr[0x30..0x34].copy_from_slice(&UPDATE_MAGIC.to_le_bytes());
-        // 0x33: mov ebx, entry (e_entry from the staged ELF)
-        tr[0x33] = 0xBB;
-        tr[0x34..0x38].copy_from_slice(&(e_entry as u32).to_le_bytes());
-        // 0x38: jmp ebx
-        tr[0x38] = 0xFF; tr[0x39] = 0xD3;
+/// Closed-interval overlap check for the loader's segment guards.
+fn overlaps(a: usize, a_len: usize, b: usize, b_len: usize) -> bool {
+    a < b + b_len && b < a + a_len
+}
 
-        // Write the trampoline to the scratch page.
-        core::ptr::copy_nonoverlapping(
-            tr.as_ptr(),
-            tramp,
-            0x40,
-        );
 
-        // The far-jump: the fword is [offset u32][selector u16] at a
-        // fixed low slot. The jump drops long mode to 32-bit compat
-        // (selector 0x18 = the L=0 D=1 code segment in the boot GDT),
-        // landing at the trampoline with the identity map still
-        // active. The trampoline's first instruction clears PG,
-        // completing the transition to physical addressing.
-        let fword = tramp.add(0x50);
+/// T4b: emits the compat-drop trampoline and jumps to it.
+///
+/// The trampoline page layout: code at 0x00..0x56 (cld, PG/CR3 off,
+/// private stack, per-segment copy with the dword tail and the bss
+/// zero-fill), the segment table at 0x60 (16-byte entries), the
+/// far-jump operand at 0xF0.
+///
+/// SAFETY: `build_segment_table` validated the layout; `count`
+/// segments sit in the table at `tramp + TABLE_OFF`; `entry` is the
+/// new kernel's 32-bit entry; the GDT carries the 32-bit code
+/// segment at selector 0x18.
+unsafe fn load_and_jump(count: usize, entry: usize, tramp: *mut u8) -> ! {
+    // The emitted 32-bit code. Offsets are commented per instruction;
+    // the rel8 branches were derived against this layout:
+    //   0x00 cld / 0x01 pg off / 0x0c cr3=0 / 0x11 stack / 0x16 table
+    //   0x1b count / 0x20 seg_loop / 0x43 zero_done / 0x4a done
+    let mut tr = [0u8; 0x60];
+    // 0x00: cld — the rep strings assume forward
+    tr[0x00] = 0xFC;
+    // 0x01: mov eax, cr0
+    tr[0x01] = 0x0F; tr[0x02] = 0x20; tr[0x03] = 0xC0;
+    // 0x04: and eax, 0x7fffffff — PG (bit 31) off
+    tr[0x04] = 0x25;
+    tr[0x05..0x09].copy_from_slice(&0x7FFF_FFFFu32.to_le_bytes());
+    // 0x09: mov cr0, eax — paging off; EIP continues (identity map)
+    tr[0x09] = 0x0F; tr[0x0A] = 0x22; tr[0x0B] = 0xC0;
+    // 0x0c: xor eax, eax
+    tr[0x0C] = 0x31; tr[0x0D] = 0xC0;
+    // 0x0e: mov cr3, eax — flush the TLB
+    tr[0x0E] = 0x0F; tr[0x0F] = 0x22; tr[0x10] = 0xD8;
+    // 0x11: mov esp, trampoline page top — the segment copies destroy
+    // the old kernel's stack, so the loop lives on its own 4 KiB
+    tr[0x11] = 0xBC;
+    tr[0x12..0x16].copy_from_slice(&((TRAMPOLINE + 0x1000) as u32).to_le_bytes());
+    // 0x16: mov ebx, table
+    tr[0x16] = 0xBB;
+    tr[0x17..0x1B].copy_from_slice(&((TRAMPOLINE + TABLE_OFF) as u32).to_le_bytes());
+    // 0x1b: mov ecx, count
+    tr[0x1B] = 0xB9;
+    tr[0x1C..0x20].copy_from_slice(&(count as u32).to_le_bytes());
+    // 0x20: seg_loop — push ecx
+    tr[0x20] = 0x51;
+    // 0x21: mov edi, [ebx] — dst = p_paddr
+    tr[0x21] = 0x8B; tr[0x22] = 0x3B;
+    // 0x23: mov esi, [ebx+4] — src = staging + p_offset
+    tr[0x23] = 0x8B; tr[0x24] = 0x73; tr[0x25] = 0x04;
+    // 0x26: mov ecx, [ebx+8] — filesz
+    tr[0x26] = 0x8B; tr[0x27] = 0x4B; tr[0x28] = 0x08;
+    // 0x29: shr ecx, 2 — dword count
+    tr[0x29] = 0xC1; tr[0x2A] = 0xE9; tr[0x2B] = 0x02;
+    // 0x2c: rep movsd
+    tr[0x2C] = 0xF3; tr[0x2D] = 0xA5;
+    // 0x2e: mov ecx, [ebx+8]
+    tr[0x2E] = 0x8B; tr[0x2F] = 0x4B; tr[0x30] = 0x08;
+    // 0x31: and ecx, 3 — the dword tail (filesz % 4)
+    tr[0x31] = 0x83; tr[0x32] = 0xE1; tr[0x33] = 0x03;
+    // 0x34: rep movsb
+    tr[0x34] = 0xF3; tr[0x35] = 0xA4;
+    // 0x36: mov ecx, [ebx+0xc] — memsz
+    tr[0x36] = 0x8B; tr[0x37] = 0x4B; tr[0x38] = 0x0C;
+    // 0x39: sub ecx, [ebx+8] — memsz - filesz (unsigned, >= 0)
+    tr[0x39] = 0x2B; tr[0x3A] = 0x4B; tr[0x3B] = 0x08;
+    // 0x3c: jbe zero_done (rel8 0x04: 0x3e + 4 = 0x42) — filesz == memsz
+    tr[0x3C] = 0x76; tr[0x3D] = 0x04;
+    // 0x3e: xor eax, eax
+    tr[0x3E] = 0x31; tr[0x3F] = 0xC0;
+    // 0x40: rep stosb — zero the bss tail (EDI continues the copy)
+    tr[0x40] = 0xF3; tr[0x41] = 0xAA;
+    // 0x42: zero_done — add ebx, 16
+    tr[0x42] = 0x83; tr[0x43] = 0xC3; tr[0x44] = 0x10;
+    // 0x45: pop ecx
+    tr[0x45] = 0x59;
+    // 0x46: dec ecx
+    tr[0x46] = 0x49;
+    // 0x47: jnz seg_loop (0x20 - 0x49 = -41 = 0xd7)
+    tr[0x47] = 0x75; tr[0x48] = 0xD7;
+    // 0x49: done — mov eax, UPDA (the new entry reads the protocol)
+    tr[0x49] = 0xB8;
+    tr[0x4A..0x4E].copy_from_slice(&UPDATE_MAGIC.to_le_bytes());
+    // 0x4e: mov ebx, entry
+    tr[0x4E] = 0xBB;
+    tr[0x4F..0x53].copy_from_slice(&(entry as u32).to_le_bytes());
+    // 0x53: jmp ebx
+    tr[0x53] = 0xFF; tr[0x54] = 0xD3;
+
+    // SAFETY: the page is identity-mapped and reserved for this path.
+    unsafe {
+        core::ptr::copy_nonoverlapping(tr.as_ptr(), tramp, tr.len());
+
+        // The far-jump operand: offset32 then selector16 — m16:32 in
+        // 64-bit mode lands in 32-bit compatibility mode at the
+        // trampoline with paging still on; the code above clears it.
+        let fword = tramp.add(FWORD_OFF);
         core::ptr::write_volatile(fword.cast::<u32>(), TRAMPOLINE as u32);
         core::ptr::write_volatile(fword.add(4).cast::<u16>(), 0x18);
         core::arch::asm!(
@@ -1182,7 +1267,7 @@ extern "C" fn kernel_main() -> ! {
     let mut uart = Serial::new(RawPorts, COM1);
     uart.init(1);
     BOOT_HW.store(
-        usize::from(boot_protocol() == 2),
+        usize::from(matches!(boot_protocol(), 2 | 3)),
         core::sync::atomic::Ordering::Relaxed,
     );
     if let Some(bits) = cmos::read_markers(&mut ports) {
@@ -1192,10 +1277,10 @@ extern "C" fn kernel_main() -> ! {
     } else {
         uart.write_str("CMOS: no prior hardware run\n");
     }
-    uart.write_str(if boot_protocol() == 2 {
-        "OMNIOSK UP (multiboot2 -> long mode)\n"
-    } else {
-        "OMNIOSK UP (PVH -> long mode)\n"
+    uart.write_str(match boot_protocol() {
+        2 => "OMNIOSK UP (multiboot2 -> long mode)\n",
+        3 => "OMNIOSK UP (update-loaded -> long mode)\n",
+        _ => "OMNIOSK UP (PVH -> long mode)\n",
     });
 
     // ---- heap: carve the microcore heap from the PVH memory map ----
@@ -1280,10 +1365,13 @@ extern "C" fn kernel_main() -> ! {
             iosq: pages[4],
             iocq: pages[5],
         };
-        // multiboot2 boot == real hardware: the disk carries a live
-        // GPT, so the smoke validates read-consistency and skips the
-        // write test (no safe scratch on a live filesystem).
-        let hw = boot_protocol() == 2;
+        // multiboot2 or OTA-update boot == real-hardware semantics: the
+        // disk may carry a live GPT, so the smoke validates
+        // read-consistency and skips the write test (no safe scratch on
+        // a live filesystem). The OTA QEMU regression boots kind 3
+        // behind -kernel deliberately: it exercises the exact path the
+        // update-loaded real machine takes.
+        let hw = boot_protocol() != 1;
         let mut nvme_session = nvme::smoke(&nvme_pages, hw);
         let mut nvme_ok = nvme_session.is_some();
         if let Some(session) = nvme_session.as_mut() {
@@ -1347,30 +1435,58 @@ extern "C" fn kernel_main() -> ! {
             };
             // T4: the OTA loader — a staged update on the disk (LBAs
             // 34+: the header, then the ELF) replaces the running
-            // kernel before anything else runs. Runs after the NIC
-            // evidence emission; never returns on a successful jump.
-            if let Some(size) = session.check_update() {
-                uart.write_str("OTA: staged update found\n");
-                let lbas = u32::try_from(size.div_ceil(512)).unwrap_or(0);
-                let staged = session.read_lbas_into(
-                    nvme::update_channel::DATA_LBA,
-                    lbas,
-                    STAGING as *mut u8,
-                );
-                // SAFETY: the staged image was validated by the
-                // reader; the trampoline is the fixed scratch page;
-                // both are identity-mapped.
-                // SAFETY: the staged image was validated by the
-                // reader; the trampoline is the fixed scratch page;
-                // both are identity-mapped.
-                unsafe {
-                    if elf_valid(STAGING as *const u8) {
-                        uart.write_str("OTA: ELF valid, jumping\n");
-                        load_and_jump(
-                            STAGING as *const u8,
-                            size as usize,
-                            TRAMPOLINE as *mut u8,
-                        );
+            // kernel before anything else runs. Never returns on a
+            // successful jump. Skipped on an update boot itself
+            // (boot_kind 3): the loaded kernel must not re-apply the
+            // same staged image — a power-cycle reloads the prior
+            // kernel via Limine, which re-applies with a fresh run.
+            if boot_protocol() != 3 {
+                if let Some(size) = session.check_update() {
+                    uart.write_str("OTA: staged update found\n");
+                    let lbas = u32::try_from(size.div_ceil(512)).unwrap_or(0);
+                    let staged = session
+                        .read_lbas_into(
+                            nvme::update_channel::DATA_LBA,
+                            lbas,
+                            STAGING as *mut u8,
+                        )
+                        .is_none();
+                    if !staged {
+                        uart.write_str("OTA: stage read failed at tail=");
+                        write_hex32(&mut uart, session.iosq_tail as u32);
+                        uart.write_str(" idx=");
+                        write_hex32(&mut uart, session.cqe_idx as u32);
+                        uart.write_str(" ph=");
+                        write_hex32(&mut uart, session.cqe_phase);
+                        uart.write_str("\n");
+                    }
+                    if staged && unsafe { elf_valid(STAGING as *const u8) } {                        // SAFETY: the staging region holds the `size`
+                        // staged bytes; the trampoline is the fixed
+                        // scratch page; both identity-mapped.
+                        let table = unsafe {
+                            build_segment_table(
+                                STAGING as *const u8,
+                                size as usize,
+                                TRAMPOLINE as *mut u8,
+                            )
+                        };
+                        if let Some((count, entry)) = table {
+                            uart.write_str("OTA: ELF valid, jumping\n");
+                            // SAFETY: the staged ELF passed the header
+                            // and layout validation; `count` segments
+                            // sit in the trampoline table.
+                            unsafe {
+                                load_and_jump(count, entry, TRAMPOLINE as *mut u8);
+                            }
+                        } else {
+                            uart.write_str("OTA: layout rejected, skipping\n");
+                        }
+                    } else {
+                        uart.write_str(if staged {
+                            "OTA: ELF header invalid\n"
+                        } else {
+                            "OTA: stage read failed\n"
+                        });
                     }
                 }
             }

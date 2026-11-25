@@ -74,13 +74,24 @@ pub(crate) fn cfg32(bus: u32, dev: u32, off: u32) -> u32 {
 
 /// Writes a 64-byte NVMe command entry at SQ `tail`, then rings the SQ
 /// tail doorbell with the NEW tail pointer (entry count after submission).
-fn submit(bar: usize, sq: usize, tail: usize, sq_db_off: usize, entry: &[u8; 64]) {
+fn submit(
+    bar: usize,
+    sq: usize,
+    tail: usize,
+    sq_db_off: usize,
+    qsize: usize,
+    entry: &[u8; 64],
+) {
     let slot = sq + tail * 64;
     for (i, chunk) in entry.chunks_exact(4).enumerate() {
         let v = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
         mmio32w(slot, i * 4, v);
     }
-    mmio32w(bar, sq_db_off, (tail as u32) + 1);
+    // The doorbell is the new tail INDEX, wrapped by the queue depth —
+    // a raw tail+1 at the last slot rings `qsize`, which the device
+    // rejects as beyond the queue (found by the OTA gate: the 64th
+    // staged-read I/O hung). The shadow head disambiguates full/empty.
+    mmio32w(bar, sq_db_off, (((tail as u32) + 1) % qsize as u32));
 }
 
 /// Polls the CQE at `idx` until its phase bit matches `phase` (bounded);
@@ -164,7 +175,7 @@ fn io_read_lba(s: &mut NvmeSession, lba: u64) -> bool {
     sqe[44..48].copy_from_slice(&((lba >> 32) as u32).to_le_bytes()); // CDW11: SLBA hi
     sqe[48..52].copy_from_slice(&0u32.to_le_bytes()); // CDW12: NLB-1 = 0
     let tail = s.iosq_tail;
-    submit(s.bar, s.iosq, tail, sq_db_off(1, s.stride), &sqe);
+    submit(s.bar, s.iosq, tail, sq_db_off(1, s.stride), IO_QSIZE, &sqe);
     s.iosq_tail = (tail + 1) % IO_QSIZE;
     let ok = wait_cqe(s.bar, s.iocq, s.cqe_idx, s.cqe_phase, cq_hd_off(1, s.stride), IO_QSIZE)
         .is_some();
@@ -187,7 +198,7 @@ fn io_write_lba(s: &mut NvmeSession, lba: u64) -> bool {
     sqe[44..48].copy_from_slice(&((lba >> 32) as u32).to_le_bytes()); // CDW11: SLBA hi
     sqe[48..52].copy_from_slice(&0u32.to_le_bytes()); // CDW12: NLB-1 = 0
     let tail = s.iosq_tail;
-    submit(s.bar, s.iosq, tail, sq_db_off(1, s.stride), &sqe);
+    submit(s.bar, s.iosq, tail, sq_db_off(1, s.stride), IO_QSIZE, &sqe);
     s.iosq_tail = (tail + 1) % IO_QSIZE;
     let ok = wait_cqe(s.bar, s.iocq, s.cqe_idx, s.cqe_phase, cq_hd_off(1, s.stride), IO_QSIZE)
         .is_some();
@@ -226,13 +237,13 @@ impl NvmeSession {
     /// Reads `lbas` consecutive LBAs starting at `start` into `dst`
     /// (which must be `lbas * 512` bytes). One LBA per trait read,
     /// copied out of the session's DMA page per iteration.
-    /// Returns false on the first failing read.
-    pub fn read_lbas_into(&mut self, start: u64, lbas: u32, dst: *mut u8) -> bool {
+    /// Returns None on success, or the first failing LBA.
+    pub fn read_lbas_into(&mut self, start: u64, lbas: u32, dst: *mut u8) -> Option<u64> {
         let mut buf = [0u8; 512];
         for i in 0..lbas {
             let lba = start + u64::from(i);
             if self.read_lba(lba, &mut buf).is_err() {
-                return false;
+                return Some(lba);
             }
             // SAFETY: the caller sized dst for `lbas` LBAs; the copy
             // stays inside it.
@@ -244,7 +255,7 @@ impl NvmeSession {
                 );
             }
         }
-        true
+        None
     }
 }
 
@@ -404,7 +415,7 @@ pub fn smoke(p: &NvmePages, hw: bool) -> Option<NvmeSession> {
     sqe[2..4].copy_from_slice(&1u16.to_le_bytes()); // CID 1
     sqe[24..32].copy_from_slice(&(ident as u64).to_le_bytes()); // PRP1
     sqe[40..44].copy_from_slice(&1u32.to_le_bytes()); // CDW10: CNS = 1
-    submit(bar, asq, 0, sq_db_off(0, stride), &sqe);
+    submit(bar, asq, 0, sq_db_off(0, stride), ADMIN_QSIZE as usize, &sqe);
     let dw3 = match wait_cqe(bar, acq, 0, 1, cq0_hd, ADMIN_QSIZE as usize) {
         Some(v) => v,
         None => {
@@ -443,7 +454,7 @@ pub fn smoke(p: &NvmePages, hw: bool) -> Option<NvmeSession> {
     sqe[4..8].copy_from_slice(&1u32.to_le_bytes()); // NSID 1
     sqe[24..32].copy_from_slice(&(ident as u64).to_le_bytes()); // PRP1
     sqe[40..44].copy_from_slice(&0u32.to_le_bytes()); // CDW10: CNS = 0
-    submit(bar, asq, 1, sq_db_off(0, stride), &sqe);
+    submit(bar, asq, 1, sq_db_off(0, stride), ADMIN_QSIZE as usize, &sqe);
     let dw3 = match wait_cqe(bar, acq, 1, 1, cq0_hd, ADMIN_QSIZE as usize) {
         Some(v) => v,
         None => {
@@ -478,7 +489,7 @@ pub fn smoke(p: &NvmePages, hw: bool) -> Option<NvmeSession> {
     sqe[40..44].copy_from_slice(&cdw10.to_le_bytes()); // CQID[15:0] | QSIZE0[31:16]
     sqe[44..46].copy_from_slice(&3u16.to_le_bytes()); // flags: PC + IEN
     sqe[46..48].copy_from_slice(&0u16.to_le_bytes()); // IRQ vector = 0
-    submit(bar, asq, 2, sq_db_off(0, stride), &sqe);
+    submit(bar, asq, 2, sq_db_off(0, stride), ADMIN_QSIZE as usize, &sqe);
     let dw3 = match wait_cqe(bar, acq, 2, 1, cq0_hd, ADMIN_QSIZE as usize) {
         Some(v) => v,
         None => {
@@ -514,7 +525,7 @@ pub fn smoke(p: &NvmePages, hw: bool) -> Option<NvmeSession> {
     sqe[40..44].copy_from_slice(&cdw10.to_le_bytes()); // SQID[15:0] | QSIZE0[31:16]
     sqe[44..46].copy_from_slice(&1u16.to_le_bytes()); // SQ_FLAGS: PC
     sqe[46..48].copy_from_slice(&1u16.to_le_bytes()); // CQID = 1
-    submit(bar, asq, 3, sq_db_off(0, stride), &sqe);
+    submit(bar, asq, 3, sq_db_off(0, stride), ADMIN_QSIZE as usize, &sqe);
     let dw3 = match wait_cqe(bar, acq, 3, 1, cq0_hd, ADMIN_QSIZE as usize) {
         Some(v) => v,
         None => {
@@ -537,7 +548,7 @@ pub fn smoke(p: &NvmePages, hw: bool) -> Option<NvmeSession> {
     sqe[24..32].copy_from_slice(&(readb as u64).to_le_bytes()); // PRP1
     sqe[40..44].copy_from_slice(&0u32.to_le_bytes()); // CDW10: SLBA = 0
     sqe[48..52].copy_from_slice(&0u32.to_le_bytes()); // CDW12: NLB-1 = 0
-    submit(bar, iosq, 0, sq_db_off(1, stride), &sqe);
+    submit(bar, iosq, 0, sq_db_off(1, stride), IO_QSIZE, &sqe);
     let dw3 = match wait_cqe(bar, iocq, 0, 1, cq_hd_off(1, stride), IO_QSIZE) {
         Some(v) => v,
         None => {
@@ -568,7 +579,7 @@ pub fn smoke(p: &NvmePages, hw: bool) -> Option<NvmeSession> {
         sqe[24..32].copy_from_slice(&(readb as u64).to_le_bytes()); // PRP1
         sqe[40..44].copy_from_slice(&0u32.to_le_bytes()); // CDW10: SLBA = 0
         sqe[48..52].copy_from_slice(&0u32.to_le_bytes()); // CDW12: NLB-1 = 0
-        submit(bar, iosq, 1, sq_db_off(1, stride), &sqe);
+        submit(bar, iosq, 1, sq_db_off(1, stride), IO_QSIZE, &sqe);
         let dw3 = match wait_cqe(bar, iocq, 1, 1, cq_hd_off(1, stride), IO_QSIZE) {
             Some(v) => v,
             None => {
@@ -629,7 +640,7 @@ pub fn smoke(p: &NvmePages, hw: bool) -> Option<NvmeSession> {
     sqe[24..32].copy_from_slice(&(readb as u64).to_le_bytes()); // PRP1
     sqe[40..44].copy_from_slice(&1u32.to_le_bytes()); // CDW10: SLBA lo = 1
     sqe[48..52].copy_from_slice(&0u32.to_le_bytes()); // CDW12: NLB-1 = 0
-    submit(bar, iosq, 1, sq_db_off(1, stride), &sqe);
+    submit(bar, iosq, 1, sq_db_off(1, stride), IO_QSIZE, &sqe);
     let dw3 = match wait_cqe(bar, iocq, 1, 1, cq_hd_off(1, stride), IO_QSIZE) {
         Some(v) => v,
         None => {
@@ -655,7 +666,7 @@ pub fn smoke(p: &NvmePages, hw: bool) -> Option<NvmeSession> {
     sqe[24..32].copy_from_slice(&(readb as u64).to_le_bytes()); // PRP1
     sqe[40..44].copy_from_slice(&1u32.to_le_bytes()); // CDW10: SLBA lo = 1
     sqe[48..52].copy_from_slice(&0u32.to_le_bytes()); // CDW12: NLB-1 = 0
-    submit(bar, iosq, 2, sq_db_off(1, stride), &sqe);
+    submit(bar, iosq, 2, sq_db_off(1, stride), IO_QSIZE, &sqe);
     let dw3 = match wait_cqe(bar, iocq, 2, 1, cq_hd_off(1, stride), IO_QSIZE) {
         Some(v) => v,
         None => {
