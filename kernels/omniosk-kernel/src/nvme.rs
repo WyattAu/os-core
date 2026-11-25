@@ -65,7 +65,7 @@ fn wbyte(base: usize, off: usize, v: u8) {
 }
 
 /// 32-bit PCI configuration read through 0xCF8/0xCFC (bus 0).
-fn cfg32(bus: u32, dev: u32, off: u32) -> u32 {
+pub(crate) fn cfg32(bus: u32, dev: u32, off: u32) -> u32 {
     let addr = 0x8000_0000 | (bus << 16) | (dev << 11) | (off & 0xFC);
     let mut ports = RawPorts;
     ports.out32(0xCF8, addr);

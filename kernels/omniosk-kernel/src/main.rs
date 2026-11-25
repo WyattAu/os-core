@@ -17,6 +17,7 @@
 
 mod cmos;
 mod nvme;
+mod rtl8168;
 mod vga;
 
 use core::arch::global_asm;
@@ -1120,6 +1121,39 @@ extern "C" fn kernel_main() -> ! {
                         crate::cmos::M_IDENT | crate::cmos::M_READ_CONSISTENT,
                     );
                     uart.write_str("CMOS: markers written\n");
+                    // T2: the remote-evidence channel — the same
+                    // verdict as a UDP datagram to the operator PC.
+                    let frame = heap.alloc();
+                    let ring = heap.alloc();
+                    if let (Ok(frame_phys), Ok(ring_phys)) = (frame, ring) {
+                        // SAFETY: heap pages are identity-mapped, below
+                        // 4 GiB, and never freed (ADR-0013); the driver
+                        // DMA-reads the frame and DMA-writes the ring.
+                        if let Some(mut nic) = rtl8168::probe(
+                            ring_phys as *mut u8,
+                            ring_phys,
+                            frame_phys as *mut u8,
+                            frame_phys,
+                            &mut uart,
+                        ) {
+                            let report =
+                                "OMNIOSK HW BOOT: IDENT PASS, READ-CONSISTENT PASS, WRITE SKIPPED (live GPT)";
+                            for _ in 0..5 {
+                                let sent = nic.send_udp(
+                                    [192, 168, 1, 1],
+                                    9933,
+                                    40969,
+                                    report.as_bytes(),
+                                );
+                                uart.write_str(if sent {
+                                    "NIC: udp fired\n"
+                                } else {
+                                    "NIC: udp refused (too big)\n"
+                                });
+                                kernel_sleep_ticks(&mut uart, 500);
+                            }
+                        }
+                    }
                 }
                 consistent
             } else {
