@@ -989,6 +989,192 @@ fn machine_exit(ports: &mut RawPorts, uart: &mut Serial<RawPorts>, code: u8) -> 
     }
 }
 
+
+// ---- T4: the OTA loader (docs/OTA-UPDATE.md) ----
+
+/// The staging region: the staged ELF file image (32 MiB physical —
+/// above the heap, inside both the 128 MiB QEMU mapping and the 8 GiB
+/// real mapping).
+const STAGING: usize = 0x0200_0000;
+/// The trampoline: 32-bit flat code, paging off, that copies the new
+/// kernel image to its load addresses and jumps to its entry.
+const TRAMPOLINE: usize = 0x0180_0000;
+/// The EAX value the boot entry accepts for the update-loaded
+/// hardware profile (boot_kind 3).
+const UPDATE_MAGIC: u32 = 0x5550_4441; // "UPDA"
+/// The maximum staged ELF size (512 KiB).
+const MAX_UPDATE: usize = 512 * 1024;
+/// The segment table offset within the trampoline page (past the
+/// 0x38-byte code block).
+const TABLE_OFF: usize = 0x40;
+/// The maximum segment triples the table holds.
+const MAX_SEGS: usize = 8;
+
+/// Validates the staged ELF64 header (magic, 64-bit, LE, x86-64).
+///
+/// SAFETY: `image` must point to at least 20 readable bytes in the
+/// identity-mapped staging region.
+unsafe fn elf_valid(image: *const u8) -> bool {
+    // SAFETY: fixed low offsets into the identity-mapped staging.
+    unsafe {
+        core::ptr::read_volatile(image.cast::<u32>()) == 0x464C_457F
+            && core::ptr::read_volatile(image.add(4)) == 2 // ELFCLASS64
+            && core::ptr::read_volatile(image.add(5)) == 1 // ELFDATA2LSB
+            && core::ptr::read_volatile(image.add(18).cast::<u16>()) == 0x3E // EM_X86_64
+    }
+}
+
+/// Reads a little-endian u32 from `image + off`.
+///
+/// SAFETY: 4 readable bytes at `image + off` in the identity map.
+unsafe fn rd32(image: *const u8, off: usize) -> u32 {
+    // SAFETY: aligned dword read within the staged image.
+    unsafe { core::ptr::read_volatile(image.add(off).cast::<u32>()) }
+}
+
+/// Reads a little-endian u64 from `image + off`.
+///
+/// SAFETY: 8 readable bytes at `image + off` in the identity map.
+unsafe fn rd64(image: *const u8, off: usize) -> u64 {
+    // SAFETY: aligned qword read within the staged image.
+    unsafe { core::ptr::read_volatile(image.add(off).cast::<u64>()) }
+}
+
+/// Reads a little-endian u16 from `image + off`.
+///
+/// SAFETY: 2 readable bytes at `image + off` in the identity map.
+unsafe fn rd16(image: *const u8, off: usize) -> u16 {
+    // SAFETY: aligned word read within the staged image.
+    unsafe { core::ptr::read_volatile(image.add(off).cast::<u16>()) }
+}
+
+/// T4b: loads the staged ELF and drops to the trampoline.
+///
+/// Parses the ELF64 program headers into a segment table at
+/// `tramp + 0x40`, writes the hand-assembled compat-drop code at
+/// `tramp`, then far-jumps through the GDT's 32-bit code segment.
+/// The trampoline copies each PT_LOAD segment to its `p_paddr`,
+/// clears paging, and enters the new kernel's 32-bit entry with
+/// EAX = [`UPDATE_MAGIC`].
+///
+/// SAFETY: `image` is the validated staged ELF at `STAGING` with at
+/// least `size` bytes readable; `tramp` is the fixed 24 MiB scratch
+/// page; the GDT carries the 32-bit code segment at selector 0x18.
+unsafe fn load_and_jump(image: *const u8, size: usize, tramp: *mut u8) -> ! {
+    // SAFETY: the staged image bounds were validated by the caller
+    // (size <= MAX_UPDATE, read from the disk into the staging).
+    unsafe {
+        let e_entry = rd64(image, 0x18) as usize;
+        let e_phoff = rd64(image, 0x20) as usize;
+        let e_phentsize = usize::from(rd16(image, 0x36));
+        let e_phnum = usize::from(rd16(image, 0x38));
+
+        // Parse the program headers into the segment table at
+        // tramp + 0x40. Each PT_LOAD: (dst = p_paddr, src = STAGING
+        // + p_offset, len = p_filesz). Bounded by MAX_SEGS.
+        let table = tramp.add(TABLE_OFF);
+        let mut count = 0usize;
+        for i in 0..e_phnum {
+            let ph = image.add(e_phoff + i * 56);
+            let p_type = rd32(ph, 0);
+            if p_type != 1 {
+                continue; // not PT_LOAD
+            }
+            let p_offset = rd32(ph, 8) as usize;
+            let p_paddr = rd32(ph, 24) as usize;
+            let p_filesz = rd32(ph, 32) as usize;
+            let dst = table.add(count * 12);
+            core::ptr::write_volatile(dst.cast::<u32>(), p_paddr as u32);
+            core::ptr::write_volatile(
+                dst.add(4).cast::<u32>(),
+                (STAGING + p_offset) as u32,
+            );
+            core::ptr::write_volatile(dst.add(8).cast::<u32>(), p_filesz as u32);
+            count += 1;
+            if count >= MAX_SEGS {
+                break;
+            }
+        }
+
+        // The trampoline: 32-bit flat code entered via the far-jump
+        // from long mode. Clearing PG drops to physical addressing;
+        // the seg_loop copies each table entry; the tail jumps to the
+        // new entry with EAX = UPDATE_MAGIC for the boot protocol
+        // branch.
+        let mut tr: [u8; 0x40] = [0; 0x40];
+        // 0x00: mov eax, cr0
+        tr[0x00] = 0x0F; tr[0x01] = 0x20; tr[0x02] = 0xC0;
+        // 0x03: and eax, 0x7FFFFFFF
+        tr[0x03] = 0x25;
+        tr[0x04..0x08].copy_from_slice(&0x7FFF_FFFFu32.to_le_bytes());
+        // 0x08: mov cr0, eax
+        tr[0x08] = 0x0F; tr[0x09] = 0x22; tr[0x0A] = 0xC0;
+        // 0x0B: xor eax, eax
+        tr[0x0B] = 0x31; tr[0x0C] = 0xC0;
+        // 0x0D: mov cr3, eax
+        tr[0x0D] = 0x0F; tr[0x0E] = 0x22; tr[0x0F] = 0xD8;
+        // 0x10: mov ebx, table (the table lives right after the code)
+        tr[0x10] = 0xBB;
+        tr[0x11..0x15].copy_from_slice(&((tramp as usize + TABLE_OFF) as u32).to_le_bytes());
+        // 0x15: mov ecx, count (the segment count, patched at 0x16)
+        tr[0x15] = 0xB9;
+        tr[0x16..0x1A].copy_from_slice(&(count as u32).to_le_bytes());
+        // 0x1A: seg_loop
+        // 0x1A: push ecx
+        tr[0x1A] = 0x51;
+        // 0x1B: mov edi, [ebx]
+        tr[0x1B] = 0x8B; tr[0x1C] = 0x3B;
+        // 0x1D: mov esi, [ebx+4]
+        tr[0x1D] = 0x8B; tr[0x1E] = 0x73; tr[0x1F] = 0x04;
+        // 0x20: shr ecx, 2
+        tr[0x20] = 0xC1; tr[0x21] = 0xE9; tr[0x22] = 0x02;
+        // 0x23: add ebx, 12
+        tr[0x23] = 0x83; tr[0x24] = 0xC3; tr[0x25] = 0x0C;
+        // 0x26: rep movsd
+        tr[0x26] = 0xF3; tr[0x27] = 0xA5;
+        // 0x28: pop ecx
+        tr[0x28] = 0x59;
+        // 0x29: test ecx, ecx
+        tr[0x29] = 0x85; tr[0x2A] = 0xC9;
+        // 0x2B: jz entry_load (rel8 = 0x33 - 0x2D = +6)
+        tr[0x2B] = 0x74; tr[0x2C] = 0x06;
+        // 0x2D: jmp seg_loop (rel8 = 0x1A - 0x2F = -0x15)
+        tr[0x2D] = 0xEB; tr[0x2E] = 0x15;
+        // 0x2F: (exit — the count is exhausted; fall through to the
+        // entry load)
+        // 0x2F: mov eax, UPDATE_MAGIC
+        tr[0x2F] = 0xB8;
+        tr[0x30..0x34].copy_from_slice(&UPDATE_MAGIC.to_le_bytes());
+        // 0x33: mov ebx, entry (e_entry from the staged ELF)
+        tr[0x33] = 0xBB;
+        tr[0x34..0x38].copy_from_slice(&(e_entry as u32).to_le_bytes());
+        // 0x38: jmp ebx
+        tr[0x38] = 0xFF; tr[0x39] = 0xD3;
+
+        // Write the trampoline to the scratch page.
+        core::ptr::copy_nonoverlapping(
+            tr.as_ptr(),
+            tramp,
+            0x40,
+        );
+
+        // The far-jump: the fword is [offset u32][selector u16] at a
+        // fixed low slot. The jump drops long mode to 32-bit compat
+        // (selector 0x18 = the L=0 D=1 code segment in the boot GDT),
+        // landing at the trampoline with the identity map still
+        // active. The trampoline's first instruction clears PG,
+        // completing the transition to physical addressing.
+        let fword = tramp.add(0x50);
+        core::ptr::write_volatile(fword.cast::<u32>(), TRAMPOLINE as u32);
+        core::ptr::write_volatile(fword.add(4).cast::<u16>(), 0x18);
+        core::arch::asm!(
+            "jmp fword ptr [{}]",
+            in(reg) fword,
+            options(nostack, noreturn),
+        );
+    }
+}
+
 /// `#[no_mangle]`: the boot trampoline calls this exact symbol.
 #[no_mangle]
 extern "C" fn kernel_main() -> ! {
@@ -1159,6 +1345,35 @@ extern "C" fn kernel_main() -> ! {
             } else {
                 read_ok && lba0[..nvme::MAGIC.len()] == *nvme::MAGIC
             };
+            // T4: the OTA loader — a staged update on the disk (LBAs
+            // 34+: the header, then the ELF) replaces the running
+            // kernel before anything else runs. Runs after the NIC
+            // evidence emission; never returns on a successful jump.
+            if let Some(size) = session.check_update() {
+                uart.write_str("OTA: staged update found\n");
+                let lbas = u32::try_from(size.div_ceil(512)).unwrap_or(0);
+                let staged = session.read_lbas_into(
+                    nvme::update_channel::DATA_LBA,
+                    lbas,
+                    STAGING as *mut u8,
+                );
+                // SAFETY: the staged image was validated by the
+                // reader; the trampoline is the fixed scratch page;
+                // both are identity-mapped.
+                // SAFETY: the staged image was validated by the
+                // reader; the trampoline is the fixed scratch page;
+                // both are identity-mapped.
+                unsafe {
+                    if elf_valid(STAGING as *const u8) {
+                        uart.write_str("OTA: ELF valid, jumping\n");
+                        load_and_jump(
+                            STAGING as *const u8,
+                            size as usize,
+                            TRAMPOLINE as *mut u8,
+                        );
+                    }
+                }
+            }
         }
         if nvme_ok {
             uart.write_str("NVME READ PASS\n");
