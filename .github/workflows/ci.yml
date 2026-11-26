@@ -73,7 +73,9 @@ jobs:
 
   # Loop 1: macOS + Windows legs — the shared gate runs on Linux; these
   # prove the build+test surface on the other platforms (advisory while
-  # platform-specific findings are triaged).
+  # platform-specific findings are triaged). omni-io is excluded: the
+  # io_uring seam is Linux-only by design (ADR-0016), and libc carries
+  # no io_uring symbols on these platforms.
   cross-platform:
     strategy:
       fail-fast: false
@@ -86,16 +88,16 @@ jobs:
           persist-credentials: false
 
       - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
-      - run: cargo check --workspace --all-features --locked
-      - run: cargo test --workspace --all-features --locked
+      - run: cargo check --workspace --exclude omni-io --all-features --locked
+      - run: cargo test --workspace --exclude omni-io --all-features --locked
 
       - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
-      - run: cargo check --workspace --all-features --locked
-      - run: cargo test --workspace --all-features --locked
+      - run: cargo check --workspace --exclude omni-io --all-features --locked
+      - run: cargo test --workspace --exclude omni-io --all-features --locked
 
       - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
-      - run: cargo check --workspace --all-features --locked
-      - run: cargo test --workspace --all-features --locked
+      - run: cargo check --workspace --exclude omni-io --all-features --locked
+      - run: cargo test --workspace --exclude omni-io --all-features --locked
 
   # Loop 2: performance budget - blocking since it stayed green for a full
   # loop (LOOP.md graduation policy). Same scripts/ command a developer runs
