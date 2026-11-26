@@ -716,6 +716,18 @@ fn pic_pit_start() {
 /// (~1 kHz) — the CPU rests between ticks instead of burning the
 /// window. Returns the ticks actually elapsed (the caller compares
 /// against `ms` to validate the ~1 kHz calibration).
+/// Emits `tag` to the operator PC (192.168.1.1:9933) three times with
+/// gaps. Checkpoint telemetry for real hardware: the operator observes
+/// boot progress even when a later smoke stage fails before the final
+/// report (previously the datagram was emitted only inside the NVMe
+/// success path — a failed smoke left the box dark with zero packets).
+fn beacon(nic: &mut rtl8168::Nic, uart: &mut Serial<RawPorts>, tag: &str) {
+    for _ in 0..3 {
+        let _ = nic.send_udp([192, 168, 1, 1], 9933, 40969, tag.as_bytes());
+        kernel_sleep_ticks(uart, 300);
+    }
+}
+
 fn kernel_sleep_ticks(uart: &mut Serial<RawPorts>, target: usize) -> usize {
     use core::sync::atomic::Ordering;
     let start = TIMER_TICKS.load(Ordering::Relaxed);
@@ -1410,8 +1422,44 @@ extern "C" fn kernel_main() -> ! {
         // behind -kernel deliberately: it exercises the exact path the
         // update-loaded real machine takes.
         let hw = boot_protocol() != 1;
+        // Early telemetry: probe the NIC BEFORE the smoke so every
+        // boot stage is remotely observable. Keep the Nic alive in
+        // nic_opt for later checkpoints and the final verdict report.
+        let mut nic_opt: Option<rtl8168::Nic> = None;
+        {
+            let frame = heap.alloc();
+            let ring = heap.alloc();
+            if let (Ok(frame_phys), Ok(ring_phys)) = (frame, ring) {
+                // SAFETY: heap pages are identity-mapped, below
+                // 4 GiB, and never freed (ADR-0013); the driver
+                // DMA-reads the frame and DMA-writes the ring.
+                if let Some(mut nic) = rtl8168::probe(
+                    ring_phys as *mut u8,
+                    ring_phys,
+                    frame_phys as *mut u8,
+                    frame_phys,
+                    &mut uart,
+                ) {
+                    beacon(
+                        &mut nic,
+                        &mut uart,
+                        "OMNIOSK BOOT enter: nic ok, nvme smoke starting",
+                    );
+                    nic_opt = Some(nic);
+                } else {
+                    uart.write_str("NIC: probe failed (early)\n");
+                }
+            }
+        }
         let mut nvme_session = nvme::smoke(&nvme_pages, hw);
         let mut nvme_ok = nvme_session.is_some();
+        if let Some(nic) = nic_opt.as_mut() {
+            if nvme_ok {
+                beacon(nic, &mut uart, "OMNIOSK BOOT: nvme session ok");
+            } else {
+                beacon(nic, &mut uart, "OMNIOSK BOOT: nvme smoke FAILED (no session)");
+            }
+        }
         if let Some(session) = nvme_session.as_mut() {
             // The retained session implements omni_block::BlockDevice —
             // the seam surface: re-read LBA 0 through the trait.
@@ -1435,19 +1483,8 @@ extern "C" fn kernel_main() -> ! {
                     uart.write_str("CMOS: markers written\n");
                     // T2: the remote-evidence channel — the same
                     // verdict as a UDP datagram to the operator PC.
-                    let frame = heap.alloc();
-                    let ring = heap.alloc();
-                    if let (Ok(frame_phys), Ok(ring_phys)) = (frame, ring) {
-                        // SAFETY: heap pages are identity-mapped, below
-                        // 4 GiB, and never freed (ADR-0013); the driver
-                        // DMA-reads the frame and DMA-writes the ring.
-                        if let Some(mut nic) = rtl8168::probe(
-                            ring_phys as *mut u8,
-                            ring_phys,
-                            frame_phys as *mut u8,
-                            frame_phys,
-                            &mut uart,
-                        ) {
+                    // The NIC was probed before the smoke (nic_opt).
+                    if let Some(mut nic) = nic_opt.take() {
                             let report =
                                 "OMNIOSK HW BOOT: IDENT PASS, READ-CONSISTENT PASS, WRITE SKIPPED (live GPT)";
                             for _ in 0..5 {
@@ -1464,7 +1501,6 @@ extern "C" fn kernel_main() -> ! {
                                 });
                                 kernel_sleep_ticks(&mut uart, 500);
                             }
-                        }
                     }
                 }
                 consistent
