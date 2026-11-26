@@ -28,9 +28,10 @@ jobs:
       all-features: true
       loom: true
       miri: true
-      # ADR-0005: process surfaces (xtask runner, service main) are excluded
-      # from the line gate; the lib surface stays at >=90%.
-      coverage-ignore-regex: xtask/src|omni-service/src/main.rs
+      # ADR-0005: process surfaces (xtask runner, service main, the
+      # md-server main) are excluded from the line gate; the lib
+      # surface stays at >=90%.
+      coverage-ignore-regex: xtask/src|omni-service/src/main.rs|omni-md-server/src/main.rs
 
   # REQ-OS-005 / ADR-0013: boots omniosk-kernel (PVH -> long mode) in QEMU
   # and asserts the ring smoke + the full NVMe driver path over serial
