@@ -1039,21 +1039,32 @@ fn panic(info: &PanicInfo) -> ! {
 
 /// Terminal exit, per boot protocol: the QEMU path (`boot_kind` 1)
 /// leaves through isa-debug-exit and the smoke reads the exit code;
-/// the multiboot2 path (GRUB/ISO, real firmware) has no exit device —
-/// it prints the halt line and stops, and the gate reads the serial
-/// log instead of the exit code.
+/// firmware paths (multiboot2 handoff, update-loaded) have no exit
+/// device — they print the verdict line and then request an 8042
+/// keyboard-controller reset, so the machine returns through the
+/// bootloader to the default OS (CachyOS) and ssh comes back. This is
+/// what makes the OTA loop keyboard-free: every boot ends reachable.
+/// The QEMU gates set -no-reboot, so the same reset cleanly exits QEMU.
 fn machine_exit(ports: &mut RawPorts, uart: &mut Serial<RawPorts>, code: u8) -> ! {
     if boot_protocol() == 1 {
         qemu_exit(ports, code);
     }
     uart.write_str(match boot_protocol() {
-        3 => "HALT (update boot; power-cycle reloads the prior kernel)\n",
-        _ => "HALT (multiboot2 boot; power-cycle or kexec back)\n",
+        3 => "RESET (update boot done; 8042 reset, default OS takes over)\n",
+        _ => "RESET (multiboot2 smoke done; 8042 reset, default OS takes over)\n",
     });
+    // Small drain delay so the UART shifts the verdict out.
+    let mut spins = 0u32;
+    while spins < 8_000_000 {
+        spins += 1;
+        core::hint::spin_loop();
+    }
+    // SAFETY: 8042 pulse reset — the one reset line every x86 board
+    // honors, no firmware cooperation needed. If the line is somehow
+    // masked, the loop keeps pulsing forever (never returns).
     loop {
-        // SAFETY: hlt with the PIT still ticking — the machine stays
-        // observable; nothing further runs.
-        unsafe { core::arch::asm!("hlt"); }
+        outb(0x64, 0xFE);
+        core::hint::spin_loop();
     }
 }
 

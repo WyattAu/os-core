@@ -108,7 +108,7 @@ grep -aq "OMNIOSK UP (multiboot2 -> long mode)" "$log" \
 grep -aq "NVME READ CONSISTENT (hw)" "$log" \
     || fail "hw read-consistency smoke failed"
 grep -aq "CMOS: markers written" "$log" || fail "CMOS markers not written"
-grep -aq "HALT (multiboot2 boot; power-cycle or kexec back)" "$log" \
-    || fail "the kernel never reached its halt line"
+grep -aq "RESET (multiboot2 smoke done" "$log" \
+    || fail "the kernel never reached its reset line"
 
 echo "qemu-limine: OK"

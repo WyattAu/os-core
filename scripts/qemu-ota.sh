@@ -9,7 +9,7 @@
 #   boot 1 (PVH, kind 1): full smoke -> OTA: staged update found ->
 #     OTA: ELF valid, jumping -> trampoline (32-bit compat drop)
 #   boot 2 (update, kind 3): PATCHED banner -> hw-profile read-only
-#     smoke -> CMOS markers -> HALT (no exit device on the update path)
+#     smoke -> CMOS markers -> 8042 reset (no exit device on the update path;
 #
 # The exit code cannot be used (kind 3 halts like multiboot2), so the
 # gate reads the serial log, exactly as the multiboot2 path is gated.
@@ -87,9 +87,14 @@ fail() {
     exit 1
 }
 
-# Boot 2 must have terminated in the halt loop, not a triple fault
-# (-no-reboot turns a reset into status 0 with a truncated log).
-[ "$status" -eq 124 ] || fail "qemu did not run to the halt (triple fault?)"
+# The kind-3 boot ends in an intentional 8042 reset: with -no-reboot
+# QEMU exits (status 0) the moment the guest requests it. Accept that
+# exit, but ONLY alongside the verdict line in the serial log — a
+# triple fault would exit 0 with a log that never reaches the reset.
+if [ "$status" -ne 124 ]; then
+    grep -q "RESET (update boot done" "$log" \
+        || fail "qemu exited early without the reset verdict (triple fault?)"
+fi
 
 grep -c "OTA: staged update found" "$log" | grep -q '^1$' \
     || fail "staged-update detection must fire exactly once (re-apply loop)"
@@ -111,7 +116,7 @@ for a, b in pairs:
 print("order OK")
 PYEOF
 
-grep -q "HALT (update boot; power-cycle reloads the prior kernel)" "$log" \
-    || fail "update boot never reached its halt line"
+grep -q "RESET (update boot done" "$log" \
+    || fail "update boot never reached its reset line"
 
 echo "qemu-ota: OK"
