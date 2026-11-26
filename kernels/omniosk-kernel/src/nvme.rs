@@ -347,9 +347,18 @@ pub fn smoke(p: &NvmePages, hw: bool) -> Option<NvmeSession> {
     // modern board hangs the NVMe and the NIC behind root ports), with
     // a depth bound against broken-hardware bus loops.
     let mut bar = 0usize;
+    let mut raw_bar_lo = 0u32;
+    let mut raw_bar_hi = 0u32;
     let mut where_found = (0u32, 0u32, 0u32);
     if let Some((b, d, f)) = scan_bus_for_class(0, 0, 0x0108) {
-        bar = (cfg32(b, d + f, 0x10) & 0xFFFF_FFF0) as usize;
+        // BAR0 of the NVMe is a 64-bit BAR: OVMF assigns it above 4 GiB
+        // (low dword alone can read 0, which used to print "device not
+        // found" on the mb2/OVMF path). Read both halves.
+        let lo = (cfg32(b, d + f, 0x10) & 0xFFFF_FFF0) as u64;
+        let hi = cfg32(b, d + f, 0x14) as u64;
+        bar = (lo | (hi << 32)) as usize;
+        raw_bar_lo = cfg32(b, d + f, 0x10);
+        raw_bar_hi = cfg32(b, d + f, 0x14);
         where_found = (b, d, f);
     }
     if bar == 0 {
@@ -362,6 +371,13 @@ pub fn smoke(p: &NvmePages, hw: bool) -> Option<NvmeSession> {
     write_hex(&mut uart, where_found.1);
     uart.write_byte(b'/');
     write_hex(&mut uart, where_found.2);
+    uart.write_str(" rawlo=");
+    write_hex(&mut uart, raw_bar_lo);
+    uart.write_str(" rawhi=");
+    write_hex(&mut uart, raw_bar_hi);
+    uart.write_str(" bar=");
+    write_hex(&mut uart, (bar >> 32) as u32);
+    write_hex(&mut uart, bar as u32);
     uart.write_str("\n");
     let _ = where_found;
 

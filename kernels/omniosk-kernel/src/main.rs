@@ -41,11 +41,18 @@ global_asm! {
         .asciz "Xen"
         .long _start
 
-    /* Multiboot2 header (GRUB/ISO boot path): must live within the
+    /* Multiboot2 header (GRUB/ISO/Limine boot path): must live within the
        first 32 KiB of the file and be 64-bit aligned. We ask for the
        memory map (MBI tag 6) via the information-request tag, and the
-       entry-address tag routes GRUB to the same 32-bit entry the PVH
-       path uses (EAX = 0x36D76289, EBX = &MBI). */
+       entry-address tag routes GRUB/Limine to the same 32-bit entry the
+       PVH path uses (EAX = 0x36D76289, EBX = &MBI).
+       Tag fields: type u16, flags u16, size u32, then the body. Tags
+       are 8-aligned by the loader's stride (ALIGN_UP(size, 8)), so each
+       tag carries explicit padding to the next 8-boundary — an unpadded
+       12-byte tag makes Limine read the NEXT tag from inside the
+       padding and panic "Header tag exceeds header bounds". Found by
+       the Limine-in-QEMU gate after the hardware deployment panicked
+       on the real machine. */
     .section .multiboot, "a"
     .align 8
     mb2_header:
@@ -53,20 +60,22 @@ global_asm! {
         .long 0                             /* arch: i386 */
         .long mb2_header_end - mb2_header   /* header length */
         .long -(0xE85250D6 + mb2_header_end - mb2_header) /* checksum */
-        /* information request tag: the memory map */
+        /* information request tag: the memory map (required) */
         .short 1                            /* type */
         .short 0                            /* flags */
-        .long 12                            /* size */
+        .long 12                            /* size (raw, unpadded) */
         .long 6                             /* MBI tag 6: memory map */
+        .long 0                             /* pad: stride to the next 8 */
         /* entry address tag */
-        .short 3
-        .short 0
-        .long 12
-        .long _start
+        .short 3                            /* type */
+        .short 0                            /* flags */
+        .long 12                            /* size */
+        .long _start                        /* entry: the 32-bit trampoline */
+        .long 0                             /* pad */
         /* end tag */
-        .short 0
-        .short 0
-        .long 8
+        .short 0                            /* type */
+        .short 0                            /* flags */
+        .long 8                             /* size */
     mb2_header_end:
 
     /* PVH handoff pointer: ESI at the 32-bit entry = &hvm_start_info
@@ -87,12 +96,17 @@ global_asm! {
     boot_kind:
         .long 0
 
-    /* identity page tables: pml4[0] -> pdpt[0] -> pd (512 * 2 MiB = 1 GiB) */
+    /* identity page tables: pml4[0|1] -> pdpt[0|1] -> 1 GiB pages.
+       Two PDPTs (1 TiB of identity map) because OVMF on the pc machine
+       parks the NVMe BAR in the 64-bit PCI hole at 0xC0_00000000
+       (768 GiB, PML4 index 1) — one PDPT only covers [0, 512 GiB). */
     .section .data.page_tables, "aw"
     .align 4096
     pml4:
         .zero 4096
     pdpt:
+        .zero 4096
+    pdpt1:
         .zero 4096
 
     .section .data.gdt, "aw"
@@ -177,22 +191,46 @@ global_asm! {
         xor eax, eax
         rep stosd
 
-        /* fill the identity map [0, 512 GiB) via 1 GiB pages: pml4[0] ->
-           pdpt, so SeaBIOS-assigned PCI BARs above 1 MiB are reachable */
+        /* fill the identity map [0, 1 TiB) via 1 GiB pages: pml4[0] ->
+           pdpt, pml4[1] -> pdpt1, so SeaBIOS-assigned PCI BARs above
+           1 MiB AND OVMF's 64-bit hole (768 GiB) are reachable */
         mov eax, OFFSET pdpt
         or eax, 0x003
         mov [pml4], eax
+        mov eax, OFFSET pdpt1
+        or eax, 0x003
+        mov [pml4 + 8], eax
         mov edi, OFFSET pdpt
         xor ecx, ecx
     1:
+        /* PDPE for a 1 GiB page at ecx * 2^30. Write BOTH dwords: the
+           high dword carries base bits 63:32, so without it every entry
+           >= 4 GiB silently maps VA back to physical 0. */
         mov eax, ecx
         shl eax, 30
         or eax, 0x083          /* present + write + PS(1 GiB) */
         mov [edi], eax
+        mov eax, ecx
+        shr eax, 2             /* base bits 63:32 = ecx >> 2 */
+        mov [edi + 4], eax
         add edi, 8
         inc ecx
         cmp ecx, 512
         jne 1b
+        mov edi, OFFSET pdpt1
+    2:
+        /* ecx continues at 512: pdpt1 covers VA [512 GiB, 1 TiB). */
+        mov eax, ecx
+        shl eax, 30
+        or eax, 0x083
+        mov [edi], eax
+        mov eax, ecx
+        shr eax, 2
+        mov [edi + 4], eax
+        add edi, 8
+        inc ecx
+        cmp ecx, 1024
+        jne 2b
 
         /* own GDT, then an indirect far jump (FF /5, m16:32) to force the
            CS descriptor reload — executed in 32-bit compatibility mode,

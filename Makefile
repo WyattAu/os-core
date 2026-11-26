@@ -48,6 +48,7 @@ ci: contract fmt-check lint test vet lean kernel
 kernel:
 	./scripts/qemu-omniosk.sh
 	./scripts/qemu-ota.sh
+	./scripts/qemu-limine.sh
 
 repro:
 	./scripts/repro-check.sh
