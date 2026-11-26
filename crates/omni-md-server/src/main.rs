@@ -29,11 +29,24 @@ use omni_tick::{SegmentBuf, Tick, HEADER_SIZE, TICK_SIZE};
 /// Segment capacity in records (v0.1: one fixed segment).
 const SEGMENT_RECORDS: usize = 4096;
 
-/// Shared store: the segment + the pipeline's fan-out (drained at
-/// seed time; the live feed drains on its own task in a later tranche).
+/// The fan-out's descriptor capacity — feed descriptors stay under it
+/// (`SlotTable::write` rejects `d >= N`; the consumer drains every
+/// published tick, so descriptors are reusable).
+const FAN_CAP: u64 = 64;
+
+/// Shared store: the segment + the pipeline's fan-out (the synthetic
+/// seed drains at boot; the live UDP feed drains on its own task).
 struct Store {
     segment: Mutex<SegmentBuf<'static>>,
+    fan: Mutex<Fanout<64>>,
     seeded: usize,
+    /// Feed counters: datagrams received, valid frames persisted,
+    /// datagrams dropped (wrong length or undecodable), and the next
+    /// fan-out descriptor for a fed tick.
+    udp_in: std::sync::atomic::AtomicUsize,
+    udp_ticks: std::sync::atomic::AtomicUsize,
+    udp_bad: std::sync::atomic::AtomicUsize,
+    udp_seq: std::sync::atomic::AtomicUsize,
 }
 
 /// Synthetic seed: encode a tick to the wire, decode it back through
@@ -134,10 +147,13 @@ async fn stats(State(store): State<Arc<Store>>) -> axum::response::Response {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     json_response(format!(
-        "{{\"records\":{},\"capacity\":{},\"seeded\":{}}}",
+        "{{\"records\":{},\"capacity\":{},\"seeded\":{},\"udp_in\":{},\"udp_ticks\":{},\"udp_bad\":{}}}",
         guard.count(),
         SEGMENT_RECORDS,
-        store.seeded
+        store.seeded,
+        store.udp_in.load(std::sync::atomic::Ordering::Relaxed),
+        store.udp_ticks.load(std::sync::atomic::Ordering::Relaxed),
+        store.udp_bad.load(std::sync::atomic::Ordering::Relaxed),
     ))
 }
 
@@ -163,7 +179,84 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let store = Arc::new(Store {
         segment: Mutex::new(segment),
+        fan: Mutex::new(fan),
         seeded,
+        udp_in: std::sync::atomic::AtomicUsize::new(0),
+        udp_ticks: std::sync::atomic::AtomicUsize::new(0),
+        udp_bad: std::sync::atomic::AtomicUsize::new(0),
+        udp_seq: std::sync::atomic::AtomicUsize::new(0),
+    });
+
+    // The real feed socket (ADR-0017's hardware-session tranche):
+    // one SBE frame per datagram, decoded through the same pipeline
+    // seam the synthetic seeder exercises (frame_to_tick -> fan-out
+    // -> segment). Bad datagrams count, never crash the plane.
+    let udp_port: u16 = std::env::var("OMNI_UDP_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(9990);
+    let feed_store = Arc::clone(&store);
+    let _feed = tokio::spawn(async move {
+        let Ok(socket) = tokio::net::UdpSocket::bind(("0.0.0.0", udp_port)).await else {
+            eprintln!("omni-md: UDP feed bind failed on {udp_port}");
+            return;
+        };
+        let mut buf = vec![0u8; FRAME_LEN];
+        loop {
+            let Ok(n) = socket.recv(&mut buf).await else {
+                continue;
+            };
+            feed_store
+                .udp_in
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n != FRAME_LEN {
+                feed_store
+                    .udp_bad
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                continue;
+            }
+            let Some(tick) = frame_to_tick(&buf) else {
+                feed_store
+                    .udp_bad
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                continue;
+            };
+            {
+                let mut fan = feed_store
+                    .fan
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                // The descriptor is the fed-tick counter under the
+                // fan-out's capacity — NOT the timestamp: the slot
+                // table bounds descriptors by N (a ts_ns-sized seq is
+                // always rejected).
+                let seq = u64::try_from(
+                    feed_store
+                        .udp_seq
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                )
+                .unwrap_or(0)
+                    % FAN_CAP;
+                if !fan.publish(seq, &tick) {
+                    feed_store
+                        .udp_bad
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    continue;
+                }
+                let Some(dran) = fan.drain_one() else {
+                    continue;
+                };
+                let mut segment = feed_store
+                    .segment
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if segment.push(&dran) {
+                    feed_store
+                        .udp_ticks
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }
     });
     let app = Router::new()
         .route("/healthz", get(healthz))
