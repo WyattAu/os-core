@@ -22,12 +22,13 @@ concurrency:
 
 jobs:
   quality:
-    uses: WyattAu/engineering-standards/.github/workflows/rust-kit.yml@8ecafe81296fb6d06e9a58e968d7eb64ffdf63db
+    uses: WyattAu/engineering-standards/.github/workflows/rust-kit.yml@ca8514059609
     with:
       tier: a
       all-features: true
       loom: true
       miri: true
+      coverage-test-threads: "4"
       # ADR-0005: process surfaces (xtask runner, service main, the
       # md-server main) are excluded from the line gate; the lib
       # surface stays at >=90%.
