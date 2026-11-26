@@ -13,7 +13,7 @@
 |---|---|---|---|
 | 0 | spec the vision | **met** (2026-11-09) | ADR-0009 + the corpus split |
 | 1 | omni-ring/omni-cap shipped; Lean gate green; Linux bypass spike | **met** (2026-11-20) | 11 published crate-versions (omni-ring 0.2, omni-cap, omni-heap, omni-task, omni-block, omni-sbe 0.1.1, omni-io, omni-tick 0.1/0.2, omni-md, omni-md-server); `make ci` carries the Lean gate (blocking) + Kani; A53 SQPOLL spike numbers |
-| 2 | tick-to-trade demo on one board; microcore boots QEMU -> hardware | **in progress** | QEMU boot: done, gate-enforced (blockcheck witness). Hardware boot: attempted 2026-11-25 (Lenovo i5-7400 via Limine->multiboot2, read-only smoke; verdict pending screen/CMOS reading). Tick-to-trade: the data plane exists (omni-io -> omni-sbe -> omni-md -> omni-tick -> omni-md-server); the software demo runs at 33 ns p50 (256 ticks, 169 trades); no board run yet |
+| 2 | tick-to-trade demo on one board; microcore boots QEMU -> hardware | **in progress** | QEMU boot: done, gate-enforced (blockcheck witness). Hardware boot: attempted 2026-11-25 (Lenovo i5-7400 via Limine->multiboot2, read-only smoke; verdict pending screen/CMOS reading). Tick-to-trade: the data plane exists (omni-io -> omni-sbe -> omni-md -> omni-tick -> omni-md-server); the software demo runs at 33 ns p50 (256 ticks, 169 trades); the UDP feed socket landed 2026-11-26; no board run yet |
 | 3 | microcore refinement proof; proof-carrying boot; DSL -> RTL | **rungs landed** | ADR-0014 ladder: mirrors + bitwise bridge + def-form theorems + cursor machine; Kani model-checking. The refinement proof proper (seL4-scale) remains the long pole |
 | 4 | integrated heterogeneous stack | not entered | K5/CXL-dependent |
 
@@ -22,7 +22,7 @@
 | Keystone | Standing | Next artifact |
 |---|---|---|
 | K1 verified rings + capability algebra | proven + published + model-checked | MAC-sealing handshake doc only if a consumer emerges |
-| K2 zero-bypass I/O | QEMU-proven (NVMe full path) + host io_uring seam published | real-metal NVMe smoke; UDP feed socket |
+| K2 zero-bypass I/O | QEMU-proven (NVMe full path) + host io_uring seam published; UDP feed socket landed (2026-11-26) | real-metal NVMe smoke |
 | K3 Lean proof gate | blocking in CI; executable mirrors; Kani pilot | rung D extraction (the decade pole) |
 | K4 bare-metal microcore | QEMU boot + NVMe + gated task witness | hardware boot (see the two paths below) |
 | K5 FPGA co-synthesis | parked | the board decision |
@@ -68,3 +68,31 @@
 A promise. Exit criteria are met when their evidence survives
 `make ci` and (for Phase 2) a hardware run — not when this table says
 so.
+
+## Dated log
+
+### 2026-11-26 — the OTA update loop is proven (keyboard-free path)
+
+- **T4b closed**: the omniosk kernel now detects a staged update
+  (LBAs 34+), validates the ELF, drops through the hand-encoded 32-bit
+  trampoline (per-segment copy + dword tail + bss zero-fill), and
+  re-enters itself as the update-loaded hardware profile (boot_kind 3).
+  Proof standard: ADR-0014's oracle policy — `scripts/qemu-ota.sh`
+  boots the gate with the payload's banner string patched, so the
+  second boot printing the patched string is evidence the STAGED image
+  executed (not a reboot). Gate wired into `make ci` (4f105bf).
+- The gate caught six bugs pre-push, two of them latent real-hardware
+  defects: the NVMe SQ doorbell never wrapped (every 64th I/O hung),
+  and the boot asm's bss-zero read its count from video-RAM garbage
+  (masked in QEMU by zeroed RAM; would have corrupted forward memory
+  on real silicon).
+- **omni-md real feed socket landed** (42fe8fd): one SBE frame per
+  UDP datagram decodes through the same pipeline seam as the synthetic
+  seed; `/stats` carries udp_in/udp_ticks/udp_bad. The software half
+  of the Phase-2 tick-to-trade demo's "real feed" is now a socket, not
+  a placeholder.
+- **Blocked on one physical action**: the Lenovo boots the pre-loader
+  OMNIOSK (192.168.1.191 unreachable). One Limine menu pick restores
+  CachyOS/SSH; then the new ELF deploys over SSH and every further
+  update is keyboard-free through the now-verified OTA path.
+
