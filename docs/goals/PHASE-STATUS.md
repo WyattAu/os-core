@@ -96,3 +96,29 @@ so.
   CachyOS/SSH; then the new ELF deploys over SSH and every further
   update is keyboard-free through the now-verified OTA path.
 
+- **The Limine boot path is now CI-gated** (e2888de): `scripts/qemu-limine.sh`
+  boots the deployment artifact through the server's actual Limine 12.9.6
+  under OVMF and asserts the multiboot2 smoke. It caught three latent
+  defects the PVH gates could never see: (1) the mb2 header tags were
+  mis-assembled (`.short` pairs shifted the size field; the info-request
+  tag lacked its 4-byte pad, so Limine's ALIGN_UP(8) stride skipped the
+  entry-address tag); (2) the boot identity map filled only `pml4[0]` —
+  OVMF parks the NVMe BAR at 0xC0_00000000 (768 GiB, PML4 index 1), so
+  the first MMIO read triple-faulted (not-present, IDT=0); the map now
+  covers [0, 1 TiB) via two PDPTs with both dwords written; (3) the NVMe
+  BAR read took only the low dword, so 64-bit BARs read as 0.
+- **Exit protocol changed: halt-forever -> 8042 reset** (d4cf51e): the
+  firmware paths (boot_kind 2/3) now print their verdict, drain the
+  UART, and pulse the 8042 reset line — the machine returns through the
+  bootloader to the default OS and ssh comes back. Combined with UDP
+  checkpoint beacons (NIC probed before the smoke: enter / nvme ok/fail
+  / full verdict), a hardware smoke is fully remotely observable and
+  the boot loop is keyboard-free end to end. 2026-11-26 screen
+  evidence: after Limine's "multiboot2 executable boot():/omniosk.elf"
+  line the screen stays frozen by design (the kernel talks COM1 only) —
+  a halted smoke and a hang are indistinguishable on the panel, which
+  is exactly what the beacons eliminate.
+- **Remaining physical action**: one CachyOS pick to restore SSH; then
+  deploy d4cf51e, flip UEFI BootOrder to CachyOS-default with Limine on
+  `efibootmgr --bootnext`, and every future hardware smoke is one
+  remote command.
