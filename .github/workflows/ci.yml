@@ -22,7 +22,7 @@ concurrency:
 
 jobs:
   quality:
-    uses: WyattAu/engineering-standards/.github/workflows/rust-kit.yml@ca8514059609
+    uses: WyattAu/engineering-standards/.github/workflows/rust-kit.yml@ca85140596091120d2fd9033eefd20b478d77066
     with:
       tier: a
       all-features: true
