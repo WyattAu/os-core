@@ -173,14 +173,37 @@ so.
   real address); (3) only 0x38-0x3D CMOS survives POST on this AMI
   board — the wider tail (0x40+) is POST-owned and cannot hold
   evidence (earlier diag reads there were stale garbage).
-- **Open (beacon TX)**: reads now work end to end but the chip still
-  never completes a descriptor (UDP_OK clear; OWN never clears).
-  Ruled out: ASPM (port says "not supported"), D3 (PMCSR write added),
-  I/O-BAR decode, ring-latch order (TE toggle added), 32-bit DMA.
-  Next lever: datasheet-grade RTL8168G init diff vs Linux r8169
-  (`rtl8169_hw_config`: TxConfig 0x4f000f80-class programming, C+
-  command, MTPS), or pack a ChipCmd readback into the marker word and
-  verify writes stick at all.
+- **Beacon TX closed (2026-11-27 evening): the kick register was
+  wrong for the whole 8168 family.** The TPPOLL (TxPoll) register is
+  **0x38** on the 8168 line — right after ChipCmd — not 0xD0 (that is
+  the OLD RTL8169's address; Linux r8169, banan-os, and Microsoft's RT
+  sample all use 0x38). Every kick in the first campaign went to 0xD0
+  and the chip never saw one, while MAC reads, TE echoes, the TNPDS
+  latch echo and TxConfig echoes all verified — the kick was the only
+  unverified write. One constant: `REG_TPPOLL = 0x38`. First cycle
+  after the fix: **all 11 beacons on the wire** (wire capture, hex-
+  verified frame bytes: broadcast dst, real src MAC, valid IPv4 csum
+  0xb690, ports 40969->9933) and all 11 received by the operator PC:
+  "BOOT enter" x3, "nvme session ok" x3, "IDENT PASS, READ-
+  CONSISTENT PASS, WRITE SKIPPED (live GPT)" x5.
+- **The last foot was on the operator PC**: firewalld had enp3s0 in
+  the public zone (KDE-Connect ports only) and dropped UDP 9933 at
+  netfilter — a box-originated test datagram reproduced the exact
+  "collector sees nothing" symptom with a known-good path. Fix:
+  `firewall-cmd --zone=public --add-port=9933/udp` (runtime +
+  persistent). The collector also reopens its log per write now (a
+  rotate between runs used to strand it writing into a deleted inode
+  — it silently ate one capture).
+- **Beacon-adjacent fixes that the canary ladder forced along the
+  way** (all verified by CMOS echoes in the marker word): writes to
+  the NIC go through the I/O BAR (port I/O — ChipCmd/TNPDS/TxConfig
+  echoes all land; MMIO posted writes were never proven), TxConfig is
+  programmed to the healthy 0x4f000f80, Config2.7/Config5.0
+  (clkreq/ASPM-L1) cleared under the Cfg9346 unlock (0xC0), the root
+  port gets IO+MEM+BusMaster, TNPDS is programmed across a TE toggle
+  (the chip latches the ring base on 1->0->1), and the marker word
+  now carries echoes (cmd reg, TNPDS mid-byte, MAC last byte) so the
+  next bring-up question is answered by one boot, not ten.
 - **Phase 2 status bump**: hardware boot is no longer "attempted" —
   the kernel boots, smokes the real SN750 (IDENT + read-consistency
   PASS), writes battery-backed markers, and exits through the verified
