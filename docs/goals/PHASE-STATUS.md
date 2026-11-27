@@ -13,7 +13,7 @@
 |---|---|---|---|
 | 0 | spec the vision | **met** (2026-11-09) | ADR-0009 + the corpus split |
 | 1 | omni-ring/omni-cap shipped; Lean gate green; Linux bypass spike | **met** (2026-11-20) | 11 published crate-versions (omni-ring 0.2, omni-cap, omni-heap, omni-task, omni-block, omni-sbe 0.1.1, omni-io, omni-tick 0.1/0.2, omni-md, omni-md-server); `make ci` carries the Lean gate (blocking) + Kani; A53 SQPOLL spike numbers |
-| 2 | tick-to-trade demo on one board; microcore boots QEMU -> hardware | **in progress** | QEMU boot: done, gate-enforced (blockcheck witness). Hardware boot: attempted 2026-11-25 (Lenovo i5-7400 via Limine->multiboot2, read-only smoke; verdict pending screen/CMOS reading). Tick-to-trade: the data plane exists (omni-io -> omni-sbe -> omni-md -> omni-tick -> omni-md-server); the software demo runs at 33 ns p50 (256 ticks, 169 trades); the UDP feed socket landed 2026-11-26; no board run yet |
+| 2 | tick-to-trade demo on one board; microcore boots QEMU -> hardware | **in progress** | QEMU boot: done, gate-enforced (blockcheck witness). Hardware boot: **working, unattended** (2026-11-27: Lenovo i5-7400, Limine->multiboot2 one-shot, NVMe read-consistency PASS on the SN750, battery-backed CMOS markers, CF9 exit back to CachyOS; 12+ cycles). Tick-to-trade: the data plane exists (omni-io -> omni-sbe -> omni-md -> omni-tick -> omni-md-server); the software demo runs at 33 ns p50 (256 ticks, 169 trades); the UDP feed socket landed 2026-11-26; no board run yet |
 | 3 | microcore refinement proof; proof-carrying boot; DSL -> RTL | **rungs landed** | ADR-0014 ladder: mirrors + bitwise bridge + def-form theorems + cursor machine; Kani model-checking. The refinement proof proper (seL4-scale) remains the long pole |
 | 4 | integrated heterogeneous stack | not entered | K5/CXL-dependent |
 
@@ -122,3 +122,66 @@ so.
   deploy d4cf51e, flip UEFI BootOrder to CachyOS-default with Limine on
   `efibootmgr --bootnext`, and every future hardware smoke is one
   remote command.
+
+### 2026-11-27 — hardware loop is real: 12+ unattended cycles, NVMe smoke PASS on the SN750
+
+- **The box recovered and the loop closed.** The wedged M.2 (PCIe link
+  dropped by hard power-offs; a reseat restored it) came back; firmware
+  rewrote Boot0001 to a real Limine path; the ESP limine.conf was
+  pre-flighted in QEMU with the drive's own Limine 12.9.6; a persistent
+  NM keyfile replaced the hand-set static IP (never bind by interface
+  name on this fleet — the NIC renames between installs).
+- **`bootctl set-oneshot OMNIOSK` + plain reboot is the keyboard-free
+  one-shot** (`systemctl reboot --boot-loader-entry` does not work:
+  systemd only knows Type-1 entries; Limine advertises Type-3 and
+  consumes `LoaderEntryOneShot` itself). Every hardware smoke is now
+  one ssh command; 12+ cycles all returned to CachyOS on their own.
+- **Reset protocol fixed for this board**: the 8042 pulse loop hung
+  forever (the board ignores that line). `machine_exit` now does
+  CF9 (0x02->0x06) -> 8042 -> triple fault, each after a UART drain;
+  QEMU (-no-reboot) and the board both honor CF9. Gate-verified in
+  qemu-limine/qemu-ota (the OTA gate even catches "reset without the
+  verdict line").
+- **The hang root cause is found and gated**: the NIC beacon slept in
+  ticks BEFORE `timer_start()` — `hlt` with no tick source sleeps
+  forever and the no-progress guard cannot fire (it only runs after an
+  hlt wake-up). The CMOS stage byte (new: 0x3E, written at every
+  milestone) pinned it at `NIC_OK`. The QEMU gates never saw it
+  because they have no RTL8168, so the beacon path never ran. Fixed:
+  tick source starts before the beacon, `kernel_sleep_ticks` no longer
+  `hlt`s (busy-spin + bounded bail), and a "SLEEP DEAD-SOURCE" gate
+  assertion fails if the hang ever returns. The OTA gate also caught
+  the ordering regression (tick-start moved above the beacon made the
+  trampoline jump interruptible — a PIT tick inside the 32-bit flat
+  trampoline triple-faults): `load_and_jump` now `cli`s and masks the
+  PIC.
+- **The RTL8168 driver's wire contracts moved to the host-testable
+  `omniosk::net`** (6 unit tests in the workspace): the old driver
+  encoded the Tx descriptor in the WRONG field order (address in
+  opts1, flags in opts2 — Linux r8169 `struct TxDesc` is opts1/opts2/
+  addr@8) and put the UDP header at offset 42 instead of 34 (8 bytes
+  after the IPv4 header) — both shipped as "looks fine, transmits
+  nothing". QEMU has no 8168 model; these bugs were invisible to every
+  gate until the encoder became pure host-tested code.
+- **NIC bring-up lessons (all CMOS-canary-verified on the M710q's
+  RTL8168G, XID 4c0)**: (1) the family is 32-bit-DMA only — ring and
+  frame pages must be allocated below 4 GiB (heap pages now retried
+  until low; marker bit DMA32); (2) a soft reset (RST bit) erases the
+  register file INCLUDING the autoloaded MAC and it never re-loads —
+  don't reset, reuse firmware's state (MAC canary in the marker word:
+  XOR/first/last = 0x59/0x6c/0x65 exactly when the window reads the
+  real address); (3) only 0x38-0x3D CMOS survives POST on this AMI
+  board — the wider tail (0x40+) is POST-owned and cannot hold
+  evidence (earlier diag reads there were stale garbage).
+- **Open (beacon TX)**: reads now work end to end but the chip still
+  never completes a descriptor (UDP_OK clear; OWN never clears).
+  Ruled out: ASPM (port says "not supported"), D3 (PMCSR write added),
+  I/O-BAR decode, ring-latch order (TE toggle added), 32-bit DMA.
+  Next lever: datasheet-grade RTL8168G init diff vs Linux r8169
+  (`rtl8169_hw_config`: TxConfig 0x4f000f80-class programming, C+
+  command, MTPS), or pack a ChipCmd readback into the marker word and
+  verify writes stick at all.
+- **Phase 2 status bump**: hardware boot is no longer "attempted" —
+  the kernel boots, smokes the real SN750 (IDENT + read-consistency
+  PASS), writes battery-backed markers, and exits through the verified
+  reset path, unattended, every time.
