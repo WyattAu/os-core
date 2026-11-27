@@ -32,8 +32,8 @@ TARGET_DIR="$(cargo metadata --format-version 1 --no-deps \
     | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')"
 BIN="$TARGET_DIR/x86_64-unknown-none/release/omniosk-kernel"
 
-# Stage the update: LBA 0 the data-round-trip magic, LBA 34 the header
-# (OMUP magic u32 + size u32, little-endian), LBA 35+ the payload —
+# Stage the update: LBA 0 the data-round-trip magic, LBA 66 the header
+# (OMUP magic u32 + size u32, little-endian), LBA 67+ the payload —
 # the same ELF with the update-boot banner replaced by a proof string
 # of identical length (byte-for-byte, same-length .rodata swap).
 mkdir -p tests
@@ -51,7 +51,7 @@ img = bytearray(16 * 1024 * 1024)
 magic = b"OMNIOSK-NVME-OK!"
 img[0 : len(magic)] = magic
 
-header_lba, data_lba = 34, 35
+header_lba, data_lba = 66, 67
 assert len(payload) <= 512 * 1024, "payload exceeds update_channel::MAX_SIZE"
 hdr = struct.pack("<II", 0x5055_4D4F, len(payload))  # "OMUP" LE + size
 img[header_lba * 512 : header_lba * 512 + 8] = hdr

@@ -31,8 +31,8 @@ Layout:
 
 | LBA | Content |
 |---|---|
-| 34 | update header: magic `OMUP` u32, ELF size u32 |
-| 35.. | the new `omniosk.elf` file bytes, contiguous |
+| 66 | update header: magic `OMUP` u32, ELF size u32 |
+| 67.. | the new `omniosk.elf` file bytes, contiguous |
 
 The publisher (CachyOS, over SSH) writes both with `dd`; the loader
 (omniosk, at boot) validates and consumes. Clearing the header magic
@@ -42,10 +42,10 @@ acknowledges consumption.
 
 After the smoke passes and the CMOS markers are written:
 
-1. Read LBA 34; require the `OMUP` magic and a plausible size
+1. Read LBA 66; require the `OMUP` magic and a plausible size
    (64 <= size <= 512 KiB). No magic -> no update; continue to the
    normal halt.
-2. Copy the ELF (size bytes, from LBA 35) into the staging region at
+2. Copy the ELF (size bytes, from LBA 67) into the staging region at
    physical 0x2000000 (32 MiB — above the heap, inside the 128 MiB
    QEMU mapping and the 8 GiB real mapping).
 3. Validate the ELF64 header (`0x464C457F` magic, 64-bit, x86-64
@@ -70,7 +70,7 @@ After the smoke passes and the CMOS markers are written:
 
 ## The loop and its breaker
 
-- A successful update boot clears the header magic at LBA 34 and
+- A successful update boot clears the header magic at LBA 66 and
   writes its own CMOS markers — the next boot sees no staged update
   and runs normally (halting after the smoke).
 - A failed update boot (crash before the clear) leaves the staging
@@ -84,8 +84,8 @@ After the smoke passes and the CMOS markers are written:
 
 Once live, the full remote iteration needs no keyboard:
 
-1. The operator builds a new kernel and `dd`s it to LBAs 35+ plus the
-   header to LBA 34 over SSH from CachyOS.
+1. The operator builds a new kernel and `dd`s it to LBAs 67+ plus the
+   header to LBA 66 over SSH from CachyOS.
 2. `ssh sudo systemctl reboot`.
 3. Limine -> OMNIOSK -> the smoke -> the update load -> the new kernel
    -> its smoke -> its UDP markers -> halt.

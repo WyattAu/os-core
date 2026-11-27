@@ -213,7 +213,7 @@ fn io_write_lba(s: &mut NvmeSession, lba: u64) -> bool {
 use omni_block::{wire, BlockDevice, BlockError};
 
 impl NvmeSession {
-    /// Reads the OTA update header from LBA 34 and validates it.
+    /// Reads the OTA update header from LBA 66 and validates it.
     /// Returns the staged ELF size when an update is present.
     /// The read is safe on any disk (live GPT included — the header
     /// LBA sits in the alignment gap no filesystem owns).
@@ -768,9 +768,15 @@ impl RawPorts {
 /// writes land only in this gap — never LBA 0/1). See docs/OTA-UPDATE.md.
 pub mod update_channel {
     /// The update header LBA: magic `OMUP` u32 + the ELF size u32.
-    pub const HEADER_LBA: u64 = 34;
-    /// The ELF file bytes start at this LBA, contiguous.
-    pub const DATA_LBA: u64 = 35;
+    /// LBA 66 sits in the alignment gap BEYOND the primary GPT
+    /// partition array (LBAs 34-65, 128 entries x 128 bytes) and
+    /// before the first partition at 2048 — a real GPT disk owns
+    /// LBA 34, which the QEMU gate's bare test disk never shows.
+    pub const HEADER_LBA: u64 = 66;
+    /// The ELF file bytes start at this LBA, contiguous. With the
+    /// 512 KiB channel cap the payload spans LBAs 67-1087, inside
+    /// the gap (first partition at 2048).
+    pub const DATA_LBA: u64 = 67;
     /// The header magic, little-endian on the wire.
     pub const MAGIC: u32 = 0x5055_4D4F; // "OMUP" LE
     /// The maximum accepted update size (512 KiB).
