@@ -721,11 +721,15 @@ fn pic_pit_start() {
 /// boot progress even when a later smoke stage fails before the final
 /// report (previously the datagram was emitted only inside the NVMe
 /// success path — a failed smoke left the box dark with zero packets).
-fn beacon(nic: &mut rtl8168::Nic, uart: &mut Serial<RawPorts>, tag: &str) {
+fn beacon(nic: &mut rtl8168::Nic, uart: &mut Serial<RawPorts>, tag: &str) -> bool {
+    let mut any = false;
     for _ in 0..3 {
-        let _ = nic.send_udp([192, 168, 1, 1], 9933, 40969, tag.as_bytes());
+        if nic.send_udp([192, 168, 1, 1], 9933, 40969, tag.as_bytes()) {
+            any = true;
+        }
         kernel_sleep_ticks(uart, 300);
     }
+    any
 }
 
 fn kernel_sleep_ticks(uart: &mut Serial<RawPorts>, target: usize) -> usize {
@@ -733,19 +737,31 @@ fn kernel_sleep_ticks(uart: &mut Serial<RawPorts>, target: usize) -> usize {
     let start = TIMER_TICKS.load(Ordering::Relaxed);
     let goal = start.saturating_add(target);
     let mut last = start;
-    while TIMER_TICKS.load(Ordering::Relaxed) < goal {
-        // SAFETY: interrupts are enabled; the PIT wakes the core.
-        unsafe { core::arch::asm!("hlt") };
+    let mut stalled = 0u32;
+    loop {
         let now = TIMER_TICKS.load(Ordering::Relaxed);
-        if now == last {
-            // No tick in a whole halt cycle: the tick source died
-            // (masked/unprogrammed) — the sleep would never end.
+        if now >= goal {
+            return now.saturating_sub(start);
+        }
+        if now != last {
+            last = now;
+            stalled = 0;
+            continue;
+        }
+        // No tick progress: busy-spin and bail after a bounded wait.
+        // The previous revision `hlt`-ed here, which hangs forever when
+        // the tick source is dead — an `hlt` with interrupts masked
+        // never returns, so the no-progress guard (which only runs
+        // after an hlt wake-up) could never fire. That is exactly the
+        // hardware-smoke hang the CMOS stage byte pinned at NIC_OK:
+        // the beacon ran before `timer_start`, slept, and never woke.
+        stalled += 1;
+        if stalled > 5_000_000 {
             uart.write_str("sleep: no tick progress\n");
             return now.saturating_sub(start);
         }
-        last = now;
+        core::hint::spin_loop();
     }
-    TIMER_TICKS.load(Ordering::Relaxed).saturating_sub(start)
 }
 
 fn timer_smoke(min_ticks: usize, max_iterations: usize) -> usize {
@@ -1016,6 +1032,7 @@ fn panic(info: &PanicInfo) -> ! {
     let mut ports = RawPorts;
     let mut uart = Serial::new(RawPorts, COM1);
     uart.write_str("\nOMNIOSK PANIC\n");
+    cmos::write_stage(&mut ports, cmos::STAGE_PANIC);
     if let Some(loc) = info.location() {
         uart.write_str(loc.file());
         uart.write_byte(b':');
@@ -1040,30 +1057,56 @@ fn panic(info: &PanicInfo) -> ! {
 /// Terminal exit, per boot protocol: the QEMU path (`boot_kind` 1)
 /// leaves through isa-debug-exit and the smoke reads the exit code;
 /// firmware paths (multiboot2 handoff, update-loaded) have no exit
-/// device — they print the verdict line and then request an 8042
-/// keyboard-controller reset, so the machine returns through the
-/// bootloader to the default OS (CachyOS) and ssh comes back. This is
-/// what makes the OTA loop keyboard-free: every boot ends reachable.
-/// The QEMU gates set -no-reboot, so the same reset cleanly exits QEMU.
+/// device — they print the verdict line and then reset, so the machine
+/// returns through the bootloader to the default OS (CachyOS) and ssh
+/// comes back. This is what makes the OTA loop keyboard-free: every
+/// boot ends reachable.
+///
+/// The reset is tried three ways, because the previous revision pulsed
+/// the 8042 keyboard-controller forever and this board ignores that
+/// line: the hardware smoke then hung at the bootloader screen instead
+/// of returning. Each mechanism below is a different reset path; none
+/// returns on a working board, and the last one (triple fault) resets
+/// the CPU even when every chipset path is masked. The QEMU gates set
+/// -no-reboot, so the same reset cleanly exits QEMU.
 fn machine_exit(ports: &mut RawPorts, uart: &mut Serial<RawPorts>, code: u8) -> ! {
     if boot_protocol() == 1 {
         qemu_exit(ports, code);
     }
     uart.write_str(match boot_protocol() {
-        3 => "RESET (update boot done; 8042 reset, default OS takes over)\n",
-        _ => "RESET (multiboot2 smoke done; 8042 reset, default OS takes over)\n",
+        3 => "RESET (update boot done; reset, default OS takes over)\n",
+        _ => "RESET (multiboot2 smoke done; reset, default OS takes over)\n",
     });
+    crate::cmos::write_stage(ports, crate::cmos::STAGE_EXIT);
     // Small drain delay so the UART shifts the verdict out.
     let mut spins = 0u32;
     while spins < 8_000_000 {
         spins += 1;
         core::hint::spin_loop();
     }
-    // SAFETY: 8042 pulse reset — the one reset line every x86 board
-    // honors, no firmware cooperation needed. If the line is somehow
-    // masked, the loop keeps pulsing forever (never returns).
+
+    // 1) PCH reset control (port 0xCF9): 0x02 = SYS_RST, 0x04 =
+    //    RST_CPU. 0x06 asserts both — the documented Intel reset.
+    outb(0xCF9, 0x02);
+    outb(0xCF9, 0x06);
+    // 2) The 8042 keyboard-controller pulse (older boards only; this
+    //    one ignores it, but the write is harmless).
+    outb(0x64, 0xFE);
+    // 3) Triple fault: load a null IDT (limit 0) and take an
+    //    interrupt. The missing gate raises #GP -> #DF -> reset.
+    // SAFETY: the null IDT is a local zeroed operand; the CPU resets
+    // before any handler runs. This is the last-resort reset.
+    unsafe {
+        let null_idt: [u8; 10] = [0; 10];
+        core::arch::asm!(
+            "lidt [{}]",
+            in(reg) null_idt.as_ptr(),
+            options(nostack, readonly)
+        );
+        core::arch::asm!("int3", options(nostack, noreturn));
+    }
+    // Unreachable on real hardware; keeps the `-> !` contract.
     loop {
-        outb(0x64, 0xFE);
         core::hint::spin_loop();
     }
 }
@@ -1230,6 +1273,17 @@ fn overlaps(a: usize, a_len: usize, b: usize, b_len: usize) -> bool {
 /// new kernel's 32-bit entry; the GDT carries the 32-bit code
 /// segment at selector 0x18.
 unsafe fn load_and_jump(count: usize, entry: usize, tramp: *mut u8) -> ! {
+    // The handover runs 32-bit flat code with paging off — no IDT gate
+    // can survive that transition, so interrupts must be masked. This
+    // used to be implicit (the tick source only came up after the OTA
+    // block); moving the tick start before the beacon made the jump
+    // interruptible and a PIT tick inside the trampoline triple-faulted
+    // the machine (caught by the qemu-ota gate).
+    core::arch::asm!("cli", options(nostack));
+    // SAFETY: raw PIC mask writes at the kernel boundary; masking all
+    // spurious vectors so `sti`-inherited pending lines cannot fire.
+    outb(0xA1, 0xFF);
+    outb(0x21, 0xFF);
     // The emitted 32-bit code. Offsets are commented per instruction;
     // the rel8 branches were derived against this layout:
     //   0x00 cld / 0x01 pg off / 0x0c cr3=0 / 0x11 stack / 0x16 table
@@ -1343,6 +1397,7 @@ extern "C" fn kernel_main() -> ! {
         3 => "OMNIOSK UP (update-loaded -> long mode)\n",
         _ => "OMNIOSK UP (PVH -> long mode)\n",
     });
+    cmos::write_stage(&mut ports, cmos::STAGE_ENTER);
 
     // ---- heap: carve the microcore heap from the PVH memory map ----
     // (REQ-OS-007; REQ-OS-005 boot-protocol seam). See heap_init below.
@@ -1354,6 +1409,28 @@ extern "C" fn kernel_main() -> ! {
         machine_exit(&mut ports, &mut uart, 34);
     };
     uart.write_str("HEAP PASS\n");
+    cmos::write_stage(&mut ports, cmos::STAGE_HEAP_OK);
+
+    // Hang-proof probe (regression guard for the hardware hang): a
+    // tick sleep with NO tick source must return in bounded time. The
+    // previous revision `hlt`-ed here forever — the CMOS stage byte
+    // pinned the hardware hang at NIC_OK, inside the beacon's first
+    // sleep. The QEMU gates grep the line below; a reintroduced `hlt`
+    // hangs QEMU into its timeout and fails the gate.
+    let dead_ticks = kernel_sleep_ticks(&mut uart, 1);
+    uart.write_str(if dead_ticks == 0 {
+        "SLEEP DEAD-SOURCE PASS (bounded bail)\n"
+    } else {
+        "SLEEP DEAD-SOURCE PASS (source already alive)\n"
+    });
+
+    // ---- tick source BEFORE any beacon sleep ----
+    // (IDT + PIC + PIT + sti; the handler only counts + EOI.) The NIC
+    // beacon below sleeps in ticks, and a sleep before this call hlt-ed
+    // forever on real hardware — the hang the CMOS stage byte pinned
+    // at NIC_OK. The QEMU gates never caught it: their boot paths have
+    // no RTL8168, so the probe fails and the beacon never runs.
+    timer_start();
 
     // The keystone moment: the Lean-proved descriptor ring, bare metal.
     let ring: SpscRing<8> = SpscRing::new();
@@ -1437,10 +1514,38 @@ extern "C" fn kernel_main() -> ! {
         // boot stage is remotely observable. Keep the Nic alive in
         // nic_opt for later checkpoints and the final verdict report.
         let mut nic_opt: Option<rtl8168::Nic> = None;
+        let mut udp_ok = false;
+        let mut dma32_ok = false;
+        cmos::write_stage(&mut ports, cmos::STAGE_NIC_START);
         {
-            let frame = heap.alloc();
-            let ring = heap.alloc();
-            if let (Ok(frame_phys), Ok(ring_phys)) = (frame, ring) {
+            // The 8168 family does 32-bit DMA only (Linux sets a 32-bit
+            // DMA mask for these chips): the ring and the frame must
+            // live below 4 GiB. First-fit is ascending, so free-and-
+            // retry until low pages appear; bounded so an all-high heap
+            // fails loudly instead of hanging.
+            let mut ring_phys: Option<usize> = None;
+            let mut frame_phys: Option<usize> = None;
+            let mut tries = 0u32;
+            while (ring_phys.is_none() || frame_phys.is_none()) && tries < 4_096 {
+                tries += 1;
+                match heap.alloc() {
+                    Ok(a) if a < 0x1_0000_0000 => {
+                        if ring_phys.is_none() {
+                            ring_phys = Some(a);
+                        } else {
+                            frame_phys = Some(a);
+                        }
+                    }
+                    Ok(a) => {
+                        let _ = heap.free(a);
+                    }
+                    Err(_) => break,
+                }
+            }
+            if ring_phys.is_some() && frame_phys.is_some() {
+                dma32_ok = true;
+            }
+            if let (Some(ring_phys), Some(frame_phys)) = (ring_phys, frame_phys) {
                 // SAFETY: heap pages are identity-mapped, below
                 // 4 GiB, and never freed (ADR-0013); the driver
                 // DMA-reads the frame and DMA-writes the ring.
@@ -1451,25 +1556,36 @@ extern "C" fn kernel_main() -> ! {
                     frame_phys,
                     &mut uart,
                 ) {
-                    beacon(
+                    cmos::write_stage(&mut ports, cmos::STAGE_NIC_OK);
+                    udp_ok |= beacon(
                         &mut nic,
                         &mut uart,
                         "OMNIOSK BOOT enter: nic ok, nvme smoke starting",
                     );
                     nic_opt = Some(nic);
                 } else {
+                    cmos::write_stage(&mut ports, cmos::STAGE_NIC_FAIL);
                     uart.write_str("NIC: probe failed (early)\n");
                 }
             }
         }
+        cmos::write_stage(&mut ports, cmos::STAGE_NVME_START);
         let mut nvme_session = nvme::smoke(&nvme_pages, hw);
         let mut nvme_ok = nvme_session.is_some();
-        if let Some(nic) = nic_opt.as_mut() {
+        cmos::write_stage(
+            &mut ports,
             if nvme_ok {
-                beacon(nic, &mut uart, "OMNIOSK BOOT: nvme session ok");
+                cmos::STAGE_NVME_OK
             } else {
-                beacon(nic, &mut uart, "OMNIOSK BOOT: nvme smoke FAILED (no session)");
-            }
+                cmos::STAGE_NVME_FAIL
+            },
+        );
+        if let Some(nic) = nic_opt.as_mut() {
+            udp_ok |= if nvme_ok {
+                beacon(nic, &mut uart, "OMNIOSK BOOT: nvme session ok")
+            } else {
+                beacon(nic, &mut uart, "OMNIOSK BOOT: nvme smoke FAILED (no session)")
+            };
         }
         if let Some(session) = nvme_session.as_mut() {
             // The retained session implements omni_block::BlockDevice —
@@ -1486,10 +1602,23 @@ extern "C" fn kernel_main() -> ! {
                     read_ok && second_ok && lba0[..32] == lba0_again[..32];
                 if consistent {
                     // The battery-backed evidence: survives the halt,
-                    // readable on the next omniosk boot.
+                    // readable on the next omniosk boot. Everything is
+                    // packed into the ONE word this board's POST never
+                    // clobbers (0x3A-0x3D): the claim bits plus a MAC
+                    // canary (XOR, first, last byte — for the M710q
+                    // 0x59/0x6C/0x65 when the register window reads
+                    // the autoloaded address).
+                    let link = nic_opt.as_ref().is_some_and(|n| n.link_up());
+                    let mac = nic_opt.as_ref().map_or([0u8; 6], |n| n.mac());
                     crate::cmos::write_markers(
                         &mut ports,
-                        crate::cmos::M_IDENT | crate::cmos::M_READ_CONSISTENT,
+                        crate::cmos::pack_markers(
+                            crate::cmos::M_IDENT
+                                | crate::cmos::M_READ_CONSISTENT
+                                | if link { crate::cmos::M_LINK_UP } else { 0 }
+                                | if dma32_ok { crate::cmos::M_DMA32 } else { 0 },
+                            mac,
+                        ),
                     );
                     uart.write_str("CMOS: markers written\n");
                     // T2: the remote-evidence channel — the same
@@ -1505,12 +1634,30 @@ extern "C" fn kernel_main() -> ! {
                                     40969,
                                     report.as_bytes(),
                                 );
+                                udp_ok |= sent;
                                 uart.write_str(if sent {
                                     "NIC: udp fired\n"
                                 } else {
-                                    "NIC: udp refused (too big)\n"
+                                    "NIC: udp refused (chip never took the descriptor)\n"
                                 });
                                 kernel_sleep_ticks(&mut uart, 500);
+                            }
+                            // Battery-backed TX evidence: a set UDP bit
+                            // means the chip accepted a descriptor —
+                            // the failure (if any) is downstream of the
+                            // NIC, not in the transmit path.
+                            if udp_ok {
+                                crate::cmos::write_markers(
+                                    &mut ports,
+                                    crate::cmos::pack_markers(
+                                        crate::cmos::M_IDENT
+                                            | crate::cmos::M_READ_CONSISTENT
+                                            | if link { crate::cmos::M_LINK_UP } else { 0 }
+                                            | crate::cmos::M_UDP_OK,
+                                        nic.mac(),
+                                    ),
+                                );
+                                uart.write_str("CMOS: udp-ok bit written\n");
                             }
                     }
                 }
@@ -1612,9 +1759,9 @@ extern "C" fn kernel_main() -> ! {
         }
     }
 
-    // ---- LAPIC timer: the microcore's first real tick ----
-    // (IDT + APIC + periodic timer; the handler only counts + EOI.)
-    timer_start();
+    // ---- LAPIC/PIT tick smoke: ticks were started before the NIC
+    // beacon (the pre-beacon sleep hung without them); this only
+    // measures the already-running tick source.
     let ticks = timer_smoke(200, 20_000_000);
     if ticks >= 10 {
         uart.write_str("TIMER PASS\n");
@@ -1737,5 +1884,6 @@ extern "C" fn kernel_main() -> ! {
     // success marker unconditionally so the QEMU smoke gate is clean.
     uart.write_str("RING SMOKE PASS\n");
     uart.write_str("HALT (idle, 1 kHz tick)\n");
+    cmos::write_stage(&mut ports, cmos::STAGE_VERDICT);
     machine_exit(&mut ports, &mut uart, 31)
 }

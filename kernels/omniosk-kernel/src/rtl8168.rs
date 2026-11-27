@@ -25,29 +25,30 @@
 const RTL_VENDOR: u16 = 0x10EC;
 const RTL_DEVICES: [u16; 3] = [0x8161, 0x8162, 0x8168];
 
-/// I/O register offsets into the 256-byte register file.
+/// Register offsets into the 256-byte register file. Accessed through
+/// the MMIO BAR (what Linux's r8169 uses exclusively on PCIe chips);
+/// the I/O BAR is a legacy alias that real 8168 silicon does not fully
+/// decode — the first hardware smoke timed out on every transmit with
+/// the I/O path even though the BAR was assigned.
 const REG_IDR0: u16 = 0x00; // MAC address, 6 bytes
 const REG_TNPDS_LOW: u16 = 0x20; // Tx descriptor ring base, low u32
 const REG_TNPDS_HIGH: u16 = 0x24; // ring base, high u32
-const REG_IMR: u16 = 0x3C; // interrupt mask, 16-bit — held at 0
 const REG_CR: u16 = 0x37; // RST 0x10 | RE 0x08 | TE 0x04
+const REG_IMR: u16 = 0x3C; // interrupt mask, 16-bit — held at 0
+const REG_PHYSTATUS: u16 = 0x6C; // bit 1 = link status
 const REG_TPPOLL: u16 = 0xD0; // NPQ = 0x40: process the Tx ring
 
 const CR_TE: u8 = 0x04;
-const CR_RST: u8 = 0x10;
 const TPPOLL_NPQ: u8 = 0x40;
 
 /// Tx descriptor (16 bytes): opts1 @0 (OWN 31 | EOR 30 | FS 29 | LS 28
 /// | length 0..16), opts2 @4 (0), address @8 (u64, low word used —
-/// the buffers live below 4 GiB by construction).
+/// the buffers live below 4 GiB by construction). The encoding lives
+/// in `omniosk::net::encode_tx_desc` so the host tests pin the layout.
 const DESC_SIZE: usize = 16;
 const RING_DESCS: usize = 16;
-const OPTS_OWN: u32 = 0x8000_0000;
-const OPTS_EOR: u32 = 0x4000_0000;
-const OPTS_FS: u32 = 0x2000_0000;
-const OPTS_LS: u32 = 0x1000_0000;
 
-// ---- raw port access (the ADR-0013 boundary, driver-local) ----
+// ---- raw bus access (the ADR-0013 boundary, driver-local) ----
 
 fn out8(port: u16, v: u8) {
     // SAFETY: I/O port write, kernel-only module (ADR-0013).
@@ -72,25 +73,175 @@ fn in8(port: u16) -> u8 {
     v
 }
 
-/// The NIC as set up by [`probe`]: I/O base, hardware MAC, and the
-/// DMA addresses of the caller-owned frame + descriptor buffers.
+
+fn mm8w(base: usize, off: u16, v: u8) {
+    // SAFETY: device BAR inside the boot identity map (ADR-0013).
+    unsafe { core::ptr::write_volatile((base + usize::from(off)) as *mut u8, v) }
+}
+
+fn mm32(base: usize, off: u16) -> u32 {
+    // SAFETY: device BAR inside the boot identity map (ADR-0013).
+    unsafe { core::ptr::read_volatile((base + usize::from(off)) as *const u32) }
+}
+
+fn mm32w(base: usize, off: u16, v: u32) {
+    // SAFETY: device BAR inside the boot identity map (ADR-0013).
+    unsafe { core::ptr::write_volatile((base + usize::from(off)) as *mut u32, v) }
+}
+
+/// The NIC as set up by [`probe`]: the MMIO register base (primary)
+/// with the I/O BAR as a last-resort fallback, the hardware MAC, and
+/// the DMA addresses of the caller-owned frame + descriptor buffers.
 pub struct Nic {
+    /// MMIO BAR base (0 = absent, use the I/O BAR).
+    mem: usize,
     io: u16,
     mac: [u8; 6],
     ring_ptr: *mut u8,
     ring_phys: usize,
     frame_ptr: *mut u8,
     frame_phys: usize,
+    /// The next ring slot to arm. The chip walks the ring from TNPDS
+    /// and stops at the first descriptor it does not own, so each send
+    /// arms the next slot; slot 15 carries EOR and wraps to slot 0.
+    tx_slot: usize,
+}
+
+impl Nic {
+    /// The 8168's MMIO register file is only reliably readable with
+    /// dword accesses: byte reads returned zeros for the MAC (IDR0-5)
+    /// on the M710q while dword reads work — so every byte read is
+    /// derived from an aligned dword read.
+    fn r8(&self, off: u16) -> u8 {
+        if self.mem != 0 {
+            let base = self.mem + usize::from(off & 0xFFFC);
+            let shift = (off & 3) * 8;
+            // SAFETY: device BAR inside the boot identity map (ADR-0013).
+            ((unsafe { core::ptr::read_volatile(base as *const u32) }) >> shift) as u8
+        } else {
+            in8(self.io + off)
+        }
+    }
+
+    fn r32(&self, off: u16) -> u32 {
+        if self.mem != 0 {
+            mm32(self.mem, off)
+        } else {
+            u32::from(in8(self.io + off)) | (u32::from(in8(self.io + off + 1)) << 8)
+        }
+    }
+
+    fn w8(&self, off: u16, v: u8) {
+        if self.mem != 0 {
+            // Dword read-modify-write: byte-granular MMIO writes are
+            // the least-tested access form on 8168 silicon, and every
+            // register here can be written dword-aligned.
+            let base = self.mem + usize::from(off & 0xFFFC);
+            let shift = (off & 3) * 8;
+            // SAFETY: device BAR inside the boot identity map (ADR-0013).
+            let cur = unsafe { core::ptr::read_volatile(base as *const u32) };
+            let val = (cur & !(0xFFu32 << shift)) | (u32::from(v) << shift);
+            unsafe { core::ptr::write_volatile(base as *mut u32, val) };
+        } else {
+            out8(self.io + off, v);
+        }
+    }
+
+    fn w32(&self, off: u16, v: u32) {
+        if self.mem != 0 {
+            mm32w(self.mem, off, v);
+        } else {
+            out32(self.io + off, v);
+        }
+    }
+
+    /// PHYstatus (0x6C) bit 1: the link is up (verified against the
+    /// banan-os RTL8169 `PHYSts` enum: FullDup=bit0, LinkSts=bit1).
+    #[must_use]
+    pub fn link_up(&self) -> bool {
+        self.r8(REG_PHYSTATUS) & 0x02 != 0
+    }
+
+    /// The MAC the driver read from IDR0-5 (diagnostic canary).
+    #[must_use]
+    pub fn mac(&self) -> [u8; 6] {
+        self.mac
+    }
+}
+
+/// Writes one config dword (the CONFIG_ADDRESS/CFC mechanism, same
+/// addressing nvme::cfg32 reads).
+fn cfg32w(bus: u32, dev: u32, off: u32, v: u32) {
+    let addr = 0x8000_0000 | (bus << 16) | ((dev & 0x1F) << 11) | (off & 0xFC);
+    out32(0xCF8, addr);
+    out32(0xCFC, v);
+}
+
+/// Walks the PCI capability list and returns the offset of the given
+/// capability ID, or None.
+fn cap_off(bus: u32, dev: u32, fbase: u32, want: u32) -> Option<u16> {
+    let mut p = (crate::nvme::cfg32(bus, dev, fbase + 0x34) & 0xFF) as u16;
+    let mut hops = 0;
+    while p != 0 && p != 0xFF && hops < 16 {
+        let cap = crate::nvme::cfg32(bus, dev, fbase + u32::from(p));
+        if cap & 0xFF == want {
+            return Some(p);
+        }
+        p = ((cap >> 8) & 0xFF) as u16;
+        hops += 1;
+    }
+    None
+}
+
+/// Walks the PCI capability list and returns the PCIe capability
+/// (ID 0x10) offset, or None.
+fn pcie_cap_off(bus: u32, dev: u32, fbase: u32) -> Option<u16> {
+    cap_off(bus, dev, fbase, 0x10)
+}
+
+/// Clears the ASPM control bits (LnkCtl[1:0]) on a PCIe function.
+/// Firmware owns ASPM on this board ("can't disable ASPM; OS doesn't
+/// have ASPM control" — the r8169 driver's own log line) and leaves the
+/// link power-managed: non-posted reads wake the link and succeed,
+/// while posted writes are silently dropped — registers read fine but
+/// our configuration and the transmit kick never landed. Bare metal
+/// simply clears the two bits in both endpoints of the link.
+fn aspm_disable(bus: u32, dev: u32, fbase: u32, uart: &mut omniosk::serial::Serial<crate::RawPorts>) {
+    let Some(cap) = pcie_cap_off(bus, dev, fbase) else {
+        return;
+    };
+    let lnkctl = fbase + u32::from(cap) + 0x10;
+    let raw = crate::nvme::cfg32(bus, dev, lnkctl);
+    if raw & 0x3 != 0 {
+        cfg32w(bus, dev, lnkctl, raw & 0xFFFF_FFFC);
+        let after = crate::nvme::cfg32(bus, dev, lnkctl);
+        uart.write_str(if after & 0x3 == 0 {
+            "NIC: ASPM disabled\n"
+        } else {
+            "NIC: ASPM clear did not stick\n"
+        });
+    }
 }
 
 /// Depth-first PCI enumeration restricted to the RTL8168 family
 /// (vendor 0x10EC, devices 0x8161/62/68), recursing through
 /// PCI-to-PCI bridges (header type 1) — the NIC hangs behind a PCIe
 /// root port on the target board, not on bus 0. Depth-bounded at 5
-/// against broken-hardware bus loops. Returns the I/O BAR base.
-fn scan_io_base(bus: u32, depth: usize) -> Option<u16> {
+/// against broken-hardware bus loops. Returns (MMIO BAR base, I/O BAR
+/// base, device location); the MMIO BAR is the register path that
+/// works on real 8168 silicon, the I/O BAR is the legacy fallback.
+fn scan_bars(
+    bus: u32,
+    depth: usize,
+    bridge: Option<(u32, u32, u32)>,
+) -> (
+    Option<usize>,
+    Option<u16>,
+    Option<(u32, u32, u32)>,
+    Option<(u32, u32, u32)>,
+) {
     if depth > 5 {
-        return None;
+        return (None, None, None, None);
     }
     for dev in 0u32..32 {
         if crate::nvme::cfg32(bus, dev, 0x00) == 0xFFFF_FFFF {
@@ -106,27 +257,57 @@ fn scan_io_base(bus: u32, depth: usize) -> Option<u16> {
             let vendor = (crate::nvme::cfg32(bus, dev, fbase) & 0xFFFF) as u16;
             let device = ((crate::nvme::cfg32(bus, dev, fbase) >> 16) & 0xFFFF) as u16;
             if vendor == RTL_VENDOR && RTL_DEVICES.contains(&device) {
-                // The I/O-space BAR: LSB set. Scan the first three BARs.
-                for bar in 0..3u32 {
+                let mut mem = None;
+                let mut io = None;
+                let mut bar = 0u32;
+                while bar < 4 {
                     let raw = crate::nvme::cfg32(bus, dev, fbase + 0x10 + bar * 4);
+                    if raw == 0xFFFF_FFFF {
+                        bar += 1;
+                        continue;
+                    }
                     if raw & 0x1 == 1 {
-                        return Some((raw & 0xFFFF_FFFC) as u16);
+                        if io.is_none() {
+                            io = Some((raw & 0xFFFF_FFFC) as u16);
+                        }
+                        bar += 1;
+                    } else {
+                        // Memory BAR: 64-bit BARs occupy two slots.
+                        let wide = raw & 0x6 == 0x4;
+                        if mem.is_none() {
+                            let mut base = (raw & 0xFFFF_FFF0) as u64;
+                            if wide {
+                                let hi =
+                                    crate::nvme::cfg32(bus, dev, fbase + 0x10 + (bar + 1) * 4);
+                                base |= (u64::from(hi)) << 32;
+                            }
+                            // A BAR above the identity map cannot be
+                            // touched; keep scanning for a usable one.
+                            if base != 0 && base < 0x0000_8000_0000_0000 {
+                                mem = Some(base as usize);
+                            }
+                        }
+                        bar += usize::from(wide) as u32 + 1;
                     }
                 }
+                return (mem, io, Some((bus, dev, fbase)), bridge);
             }
             let ftype = (crate::nvme::cfg32(bus, dev, fbase + 0x0C) >> 16) & 0x7F;
             if ftype == 1 {
                 // PCI-to-PCI bridge: recurse into the secondary bus.
                 let sec = (crate::nvme::cfg32(bus, dev, fbase + 0x18) >> 8) & 0xFF;
                 if sec > 0 {
-                    if let Some(found) = scan_io_base(sec, depth + 1) {
-                        return Some(found);
+                    let this_bridge = Some((bus, dev, fbase));
+                    let (mem, io, loc, br) =
+                        scan_bars(sec, depth + 1, bridge.or(this_bridge));
+                    if mem.is_some() || io.is_some() {
+                        return (mem, io, loc, br);
                     }
                 }
             }
         }
     }
-    None
+    (None, None, None, None)
 }
 
 /// Probes for the RTL8168 (via the PCI walk), resets the MAC, reads
@@ -147,34 +328,112 @@ pub fn probe(
     frame_phys: usize,
     uart: &mut omniosk::serial::Serial<crate::RawPorts>,
 ) -> Option<Nic> {
-    let Some(io) = scan_io_base(0, 0) else {
-        uart.write_str("NIC: RTL8168 not found (no I/O BAR)\n");
+    let (mem, io, loc, bridge) = scan_bars(0, 0, None);
+    if mem.is_none() && io.is_none() {
+        uart.write_str("NIC: RTL8168 not found (no BARs)\n");
         return None;
-    };
-    uart.write_str("NIC: io_base found\n");
+    }
+    let mem = mem.unwrap_or(0);
+    let io = io.unwrap_or(0);
+    if mem != 0 {
+        uart.write_str("NIC: mmio_base found\n");
+    } else {
+        uart.write_str("NIC: io_base found (MMIO BAR absent)\n");
+    }
 
-    // Mask interrupts entirely: the driver is fire-and-forget TX.
-    out8(io + REG_IMR, 0);
-    out8(io + REG_IMR + 1, 0);
+    // ASPM off on BOTH ends of the link before any MMIO access (see
+    // `aspm_disable`), and enable the root port itself (IO+MEM+Bus
+    // master): the NVMe works behind ITS port because firmware booted
+    // from it; nobody ever turned on the NIC's port for forwarding.
+    for target in [loc, bridge].into_iter().flatten() {
+        let (b, d, fb) = target;
+        aspm_disable(b, d, fb, uart);
+    }
+    if let Some((bb, bd, bfb)) = bridge {
+        let raw = crate::nvme::cfg32(bb, bd, bfb + 0x04);
+        cfg32w(bb, bd, bfb + 0x04, (raw & 0xFFFF_0000) | 0x0007);
+        uart.write_str("NIC: root port enabled (io+mem+busmaster)\n");
+    }
 
-    // MAC reset (RST self-clears when done; bounded poll).
-    let cr = in8(io + REG_CR);
-    out8(io + REG_CR, cr | CR_RST);
-    let mut spins = 0u32;
-    while in8(io + REG_CR) & CR_RST != 0 {
-        spins += 1;
-        if spins > 100_000 {
-            uart.write_str("NIC: reset timeout\n");
-            return None;
+    // Power state D0: if firmware parked the NIC in D3 (it was never
+    // boot-critical), config still answers but the register file reads
+    // zeros and drops writes — exactly the observed window behavior.
+    if let Some((b, d, fb)) = loc {
+        if let Some(pm) = cap_off(b, d, fb, 0x01) {
+            let pmcsr = fb + u32::from(pm) + 4;
+            let raw = crate::nvme::cfg32(b, d, pmcsr);
+            if raw & 0x3 != 0 {
+                cfg32w(b, d, pmcsr, raw & 0xFFFF_FFFC);
+                uart.write_str("NIC: PMCSR -> D0\n");
+            }
         }
     }
-    uart.write_str("NIC: reset done\n");
 
-    // The hardware MAC address (IDR0-5, byte reads).
-    let mut mac = [0u8; 6];
-    for (i, byte) in mac.iter_mut().enumerate() {
-        *byte = in8(io + REG_IDR0 + i as u16);
+    // Bus master + I/O + memory decode. The NVMe works without this
+    // write only because firmware used it to boot; the NIC was never
+    // boot-critical, so its command register arrived with BusMaster
+    // clear — registers read fine, the PHY ran, but the DMA engine
+    // never fetched a descriptor (the M710q smoke: LINK_UP set,
+    // UDP never accepted, until this write). Keep the status half
+    // of the dword: the command register is the low 16 bits only.
+    if let Some((b, d, fb)) = loc {
+        let raw = crate::nvme::cfg32(b, d, fb + 0x04);
+        let cmd = (raw & 0xFFFF_0000) | 0x0007;
+        cfg32w(b, d, fb + 0x04, cmd);
+        uart.write_str("NIC: cmd reg set (io+mem+busmaster)\n");
     }
+
+    // ---- the fingerprint dump ----
+    // REMOVED: the wide CMOS tail (0x40+) is written by POST on this
+    // AMI board and cannot hold evidence; the diagnostic content moved
+    // into `pack_markers` (MAC canary in the proven 0x3A-0x3D word).
+
+    // NO soft reset. The RTL8168G zeroes its register file on the RST
+    // bit — including the autoloaded MAC registers, which never re-load
+    // until a PCI-level reset — and stayed half-dead for the whole run:
+    // MAC read 00:00:00:00:00:00, TxConfig echoed 0, no descriptor ever
+    // taken (the CMOS canaries pinned this across three boots).
+    // Firmware hands the chip over ALIVE — MAC loaded, Rx enabled,
+    // link up — so reuse that state: keep ChipCmd, just make sure the
+    // transmit engine is on.
+    let mut nic = Nic {
+        mem,
+        io,
+        mac: [0; 6],
+        ring_ptr,
+        ring_phys,
+        frame_ptr,
+        frame_phys,
+        tx_slot: 0,
+    };
+    // Interrupts stay masked (fire-and-forget TX); a dropped IMR write
+    // is harmless — firmware's IMR may still line up IRQs, but the
+    // kernel's IDT only owns vector 0x50 and the fault gates.
+    nic.w8(REG_IMR, 0);
+    nic.w8(REG_IMR + 1, 0);
+    let cr = nic.r8(REG_CR);
+    nic.w8(REG_CR, cr | CR_TE);
+    uart.write_str("NIC: transmit enabled (no soft reset)\n");
+
+    // The hardware MAC address: two aligned dword reads (IDR0-3,
+    // IDR4-5 in the low half of the second). Byte reads of IDR returned
+    // all zeros on real 8168 silicon.
+    let mut mac = [0u8; 6];
+    if mem != 0 {
+        let lo = nic.r32(REG_IDR0);
+        let hi = nic.r32(REG_IDR0 + 4);
+        mac[0] = lo as u8;
+        mac[1] = (lo >> 8) as u8;
+        mac[2] = (lo >> 16) as u8;
+        mac[3] = (lo >> 24) as u8;
+        mac[4] = hi as u8;
+        mac[5] = (hi >> 8) as u8;
+    } else {
+        for (i, byte) in mac.iter_mut().enumerate() {
+            *byte = nic.r8(REG_IDR0 + i as u16);
+        }
+    }
+    nic.mac = mac;
     uart.write_str("NIC: mac ");
     const HEX: &[u8] = b"0123456789ABCDEF";
     for b in mac {
@@ -182,43 +441,41 @@ pub fn probe(
         uart.write_byte(HEX[(b & 0xF) as usize]);
         uart.write_byte(b':');
     }
-    uart.write_str("\n");
+    uart.write_str(if nic.link_up() {
+        " link UP\n"
+    } else {
+        " link down\n"
+    });
 
-    // Transmit descriptor ring: 16 slots, the last one carries EOR.
+    // Transmit descriptor ring: 16 slots, zeroed. The encoder sets
+    // OWN and (on the last slot) EOR; an unowned slot stops the chip.
     // SAFETY: ring/ring_phys are the caller's 256-byte-aligned DMA
     // buffer; every write below is inside it.
     unsafe {
         core::ptr::write_bytes(ring_ptr, 0, DESC_SIZE * RING_DESCS);
-        let d = ring_ptr.cast::<u32>();
-        // opts1 per slot: EOR on the last, 0 elsewhere.
-        for i in 0..RING_DESCS {
-            let opts = if i + 1 == RING_DESCS { OPTS_EOR } else { 0 };
-            d.add(i * 4 + 1).write_volatile(opts);
-        }
     }
-    out32(io + REG_TNPDS_LOW, ring_phys as u32);
-    out32(io + REG_TNPDS_HIGH, 0);
+    // The chip LATCHES the ring base on the TE 1->0->1 transition.
+    // Firmware hands TE already enabled, so writing TNPDS mid-enable
+    // left the chip polling ITS OWN old ring address — our descriptors
+    // were never read (OWN never cleared, zero beacons). Toggle TE off,
+    // program the ring, re-enable.
+    let cr = nic.r8(REG_CR);
+    nic.w8(REG_CR, cr & !CR_TE);
+    nic.w32(REG_TNPDS_LOW, ring_phys as u32);
+    nic.w32(REG_TNPDS_HIGH, 0);
+    nic.w8(REG_CR, cr | CR_TE);
 
-    // Enable the transmit engine.
-    let cr = in8(io + REG_CR);
-    out8(io + REG_CR, cr | CR_TE);
-
-    Some(Nic {
-        io,
-        mac,
-        ring_ptr,
-        ring_phys,
-        frame_ptr,
-        frame_phys,
-    })
+    Some(nic)
 }
 
 impl Nic {
     /// Transmits one UDP datagram to `dst_ip:dst_port` with `payload`.
-    /// Broadcast L2 destination (no ARP stack). Reuses descriptor
-    /// slot 0, waiting for its completion (bounded) before re-arming.
-    /// Returns `false` when the completion poll times out — the
-    /// packet may or may not have hit the wire.
+    /// The L2 destination is broadcast (no ARP stack). Each send arms
+    /// the next ring slot and waits (bounded) for the chip to release
+    /// it, so the shared frame buffer is safe to reuse.
+    ///
+    /// Returns `false` when the payload is too large or the chip never
+    /// releases the slot — the packet may or may not have hit the wire.
     pub fn send_udp(
         &mut self,
         dst_ip: [u8; 4],
@@ -226,90 +483,74 @@ impl Nic {
         src_port: u16,
         payload: &[u8],
     ) -> bool {
-        let total = 14 + 20 + 8 + payload.len();
-        if total > 1500 {
+        // SAFETY: frame_ptr is the caller's DMA buffer from probe —
+        // identity-mapped and at least MAX_FRAME bytes.
+        let frame = unsafe {
+            core::slice::from_raw_parts_mut(self.frame_ptr, omniosk::net::MAX_FRAME)
+        };
+        let Some(total) = omniosk::net::build_udp_frame(
+            frame,
+            self.mac,
+            [192, 168, 1, 191], // the server's fixed LAN address
+            dst_ip,
+            src_port,
+            dst_port,
+            payload,
+        ) else {
             return false;
-        }
-        // ---- the frame ----
-        // SAFETY: frame/frame_ptr are the caller's DMA buffer from
-        // probe; every write stays inside it.
-        unsafe {
-            let f = self.frame_ptr;
-            core::ptr::write_bytes(f, 0, total);
-            // Ethernet: broadcast dst, our MAC src, IPv4 ethertype.
-            core::ptr::write_bytes(f, 0xFF, 6);
-            for (i, b) in self.mac.iter().enumerate() {
-                f.add(6 + i).write_volatile(*b);
-            }
-            f.add(12).write_volatile(0x08u8);
-            f.add(13).write_volatile(0x00u8);
-            // IPv4 header (20 bytes @14).
-            f.add(14).write_volatile(0x45); // v4, IHL 5
-            f.add(15).write_volatile(0x00); // tos
-            let tot = (20 + 8 + payload.len()) as u16;
-            f.add(16).write_volatile((tot >> 8) as u8);
-            f.add(17).write_volatile(tot as u8);
-            f.add(18).write_volatile(0x00); // id hi
-            f.add(19).write_volatile(0x01); // id lo
-            f.add(20).write_volatile(0x40); // DF
-            f.add(21).write_volatile(0x00);
-            f.add(22).write_volatile(64); // ttl
-            f.add(23).write_volatile(17); // proto: UDP
-            f.add(24).write_volatile(0x00); // csum hi
-            f.add(25).write_volatile(0x00); // csum lo (filled below)
-            for (i, b) in [192u8, 168, 1, 191].iter().enumerate() {
-                f.add(26 + i).write_volatile(*b); // src: the server's IP
-            }
-            for (i, b) in dst_ip.iter().enumerate() {
-                f.add(30 + i).write_volatile(*b); // dst: the operator PC
-            }
-            // IPv4 checksum: ones-complement over the 20-byte header.
-            let mut sum = 0u32;
-            for i in 0..10usize {
-                let hi = u32::from(f.add(14 + i * 2).read_volatile());
-                let lo = u32::from(f.add(15 + i * 2).read_volatile());
-                sum += (hi << 8) | lo;
-            }
-            while sum >> 16 != 0 {
-                sum = (sum & 0xFFFF) + (sum >> 16);
-            }
-            let csum = !(sum as u16);
-            f.add(24).write_volatile((csum >> 8) as u8);
-            f.add(25).write_volatile(csum as u8);
-            // UDP header (8 bytes @42).
-            let sp = src_port.to_be_bytes();
-            f.add(42).write_volatile(sp[0]);
-            f.add(43).write_volatile(sp[1]);
-            let dp = dst_port.to_be_bytes();
-            f.add(44).write_volatile(dp[0]);
-            f.add(45).write_volatile(dp[1]);
-            let ulen = (8 + payload.len()) as u16;
-            f.add(46).write_volatile((ulen >> 8) as u8);
-            f.add(47).write_volatile(ulen as u8);
-            f.add(48).write_volatile(0); // checksum hi: 0 = unchecked
-            f.add(49).write_volatile(0); // checksum lo
-            for (i, b) in payload.iter().enumerate() {
-                f.add(50 + i).write_volatile(*b);
-            }
-        }
+        };
 
-        // ---- the descriptor: slot 0, FS|LS|OWN, one-shot ----
-        // SAFETY: the ring is the caller's 256-byte-aligned DMA buffer
-        // from probe; slot 0 is inside it.
+        // ---- the descriptor: rolling slot, RTL8168 layout ----
+        // opts1 @0 (OWN|EOR|FS|LS|len), opts2 @4, addr @8 (u64).
+        // The previous revision wrote the address into opts1 and the
+        // flags into opts2: the chip never saw OWN and transmitted
+        // nothing (the hardware smoke's zero-beacon failure).
+        let slot = self.tx_slot;
+        let eor = slot + 1 == RING_DESCS;
+        let desc = omniosk::net::encode_tx_desc(self.frame_phys as u64, total as u16, eor);
+        let base = slot * DESC_SIZE;
+
+        // SAFETY: `slot < RING_DESCS` and the ring is the caller's
+        // 256-byte-aligned DMA buffer from probe.
         unsafe {
-            let d = self.ring_ptr.cast::<u32>();
-            d.write_volatile(self.frame_phys as u32);
-            let opts = d.add(1).read_volatile();
-            d.add(1).write_volatile(
-                (opts & !0x0000_FFFF) | OPTS_OWN | OPTS_FS | OPTS_LS | total as u32,
-            );
+            let d = self.ring_ptr.add(base).cast::<u32>();
+            // Wait (bounded) until this slot is free: arming a slot
+            // the chip still owns corrupts the transmit.
+            let mut spins = 0u32;
+            while d.read_volatile() & omniosk::net::OPTS_OWN != 0 {
+                spins += 1;
+                if spins > 10_000_000 {
+                    return false;
+                }
+                core::hint::spin_loop();
+            }
+            core::ptr::copy_nonoverlapping(desc.as_ptr(), self.ring_ptr.add(base), DESC_SIZE);
+            // Self-check: the bytes the chip will read must carry OWN.
+            // A silent no-op here is exactly what the hardware smoke
+            // could not see.
+            if d.read_volatile() & omniosk::net::OPTS_OWN == 0 {
+                return false;
+            }
         }
 
         // Kick the transmit ring.
-        out8(self.io + REG_TPPOLL, TPPOLL_NPQ);
+        self.w8(REG_TPPOLL, TPPOLL_NPQ);
+        self.tx_slot = (slot + 1) % RING_DESCS;
 
-        // Fire-and-forget: the OWN bit clears when the chip finishes;
-        // v0.1 does not wait on it (the caller retransmits anyway).
+        // Wait (bounded) for the chip to release the slot, so the
+        // shared frame buffer is safe to overwrite on the next send.
+        // SAFETY: same ring bounds as above.
+        unsafe {
+            let d = self.ring_ptr.add(base).cast::<u32>();
+            let mut spins = 0u32;
+            while d.read_volatile() & omniosk::net::OPTS_OWN != 0 {
+                spins += 1;
+                if spins > 10_000_000 {
+                    return false;
+                }
+                core::hint::spin_loop();
+            }
+        }
         true
     }
 }
