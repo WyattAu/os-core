@@ -10,7 +10,7 @@ rebooting the target into OMNIOSK.
 import datetime
 import socket
 
-LISTEN = ("192.168.1.1", 9933)
+LISTEN = ("", 9933)  # wildcard: also catches frames with a wrong dst IP
 LOG = "/tmp/opencode/omniosk-udp.log"
 
 
@@ -19,18 +19,23 @@ def main() -> None:
     s.bind(LISTEN)
     line = f"{datetime.datetime.now().isoformat()} collector listening on {LISTEN[0]}:{LISTEN[1]}"
     print(line, flush=True)
-    with open(LOG, "a") as log:
-        log.write(line + "\n")
-        log.flush()
-        while True:
-            data, addr = s.recvfrom(2048)
-            entry = (
-                f"{datetime.datetime.now().isoformat()} "
-                f"{addr[0]}:{addr[1]} {len(data)}B {data.decode(errors='replace')}"
-            )
-            print(entry, flush=True)
+    def log_line(entry: str) -> None:
+        # Reopen per write: a log rotated or removed between runs must
+        # not strand this process writing into a deleted inode (that
+        # cost one hardware cycle's beacon capture).
+        with open(LOG, "a") as log:
             log.write(entry + "\n")
-            log.flush()
+
+    log_line(line)
+
+    while True:
+        data, addr = s.recvfrom(2048)
+        entry = (
+            f"{datetime.datetime.now().isoformat()} "
+            f"{addr[0]}:{addr[1]} {len(data)}B {data.decode(errors='replace')}"
+        )
+        print(entry, flush=True)
+        log_line(entry)
 
 
 if __name__ == "__main__":
