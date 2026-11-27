@@ -11,5 +11,6 @@
 
 #![cfg_attr(not(test), no_std)]
 
+pub mod net;
 pub mod qemu_exit;
 pub mod serial;
