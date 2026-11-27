@@ -1604,20 +1604,29 @@ extern "C" fn kernel_main() -> ! {
                     // The battery-backed evidence: survives the halt,
                     // readable on the next omniosk boot. Everything is
                     // packed into the ONE word this board's POST never
-                    // clobbers (0x3A-0x3D): the claim bits plus a MAC
-                    // canary (XOR, first, last byte — for the M710q
-                    // 0x59/0x6C/0x65 when the register window reads
-                    // the autoloaded address).
+                    // clobbers (0x3A-0x3D): the claim bits, a ChipCmd
+                    // echo, the chip's ring-base echo, and the MAC's
+                    // last byte (0x65 on the M710q when the window
+                    // reads the autoloaded address).
+                    let mac_last = nic_opt
+                        .as_ref()
+                        .map_or(0u8, |n| n.mac()[5]);
                     let link = nic_opt.as_ref().is_some_and(|n| n.link_up());
-                    let mac = nic_opt.as_ref().map_or([0u8; 6], |n| n.mac());
                     crate::cmos::write_markers(
                         &mut ports,
                         crate::cmos::pack_markers(
                             crate::cmos::M_IDENT
                                 | crate::cmos::M_READ_CONSISTENT
                                 | if link { crate::cmos::M_LINK_UP } else { 0 }
-                                | if dma32_ok { crate::cmos::M_DMA32 } else { 0 },
-                            mac,
+                                | if dma32_ok { crate::cmos::M_DMA32 } else { 0 }
+                                | if nic_opt.as_ref().is_some_and(|n| n.ring_latched()) {
+                                    crate::cmos::M_RING_LATCHED
+                                } else {
+                                    0
+                                },
+                            nic_opt.as_ref().map_or(0u8, |n| n.cmd_echo()),
+                            nic_opt.as_ref().map_or(0u8, |n| n.ring_mid()),
+                            mac_last,
                         ),
                     );
                     uart.write_str("CMOS: markers written\n");
@@ -1653,8 +1662,16 @@ extern "C" fn kernel_main() -> ! {
                                         crate::cmos::M_IDENT
                                             | crate::cmos::M_READ_CONSISTENT
                                             | if link { crate::cmos::M_LINK_UP } else { 0 }
+                                            | if dma32_ok { crate::cmos::M_DMA32 } else { 0 }
+                                            | if nic.ring_latched() {
+                                                crate::cmos::M_RING_LATCHED
+                                            } else {
+                                                0
+                                            }
                                             | crate::cmos::M_UDP_OK,
-                                        nic.mac(),
+                                        nic.cmd_echo(),
+                                        nic.ring_mid(),
+                                        nic.mac()[5],
                                     ),
                                 );
                                 uart.write_str("CMOS: udp-ok bit written\n");

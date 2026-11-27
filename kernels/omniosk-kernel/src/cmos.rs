@@ -46,7 +46,9 @@ fn cmos_write_byte(off: u8, v: u8, ports: &mut impl PortIo) {
 /// Marker bits (bit i = the i-th hardware claim proven).
 pub const M_IDENT: u32 = 1 << 0;
 pub const M_READ_CONSISTENT: u32 = 1 << 1;
-pub const M_SESSION_RETAINED: u32 = 1 << 2;
+/// The chip's TNPDS echo carries our ring's high byte — the ring base
+/// we programmed is the one it walks.
+pub const M_RING_LATCHED: u32 = 1 << 2;
 /// At least one UDP beacon was ACCEPTED BY THE CHIP (the descriptor's
 /// OWN bit cleared). Not proof of wire delivery — a switch drop or a
 /// wrong frame still counts — but it separates "the NIC never
@@ -62,23 +64,20 @@ pub const M_LINK_UP: u32 = 1 << 4;
 pub const M_DMA32: u32 = 1 << 5;
 
 /// Packs the run evidence into the ONE marker word that provably
-/// survives POST on this board (0x3A-0x3D). Bits 6-7 say the MAC was
-/// read this boot; bits 8-31 carry a MAC canary (XOR of the six
-/// bytes, the first byte, the last byte) — for the M710q the healthy
-/// values are XOR 0x59, first 0x6C, last 0x65. The wider CMOS tail
-/// (0x40+) is written by POST on this AMI board and cannot hold
-/// evidence.
+/// survives POST on this board (0x3A-0x3D): the claim bits, a TxConfig
+/// echo (byte 1: DMA burst, want 0x0f), the ring-base echo, and the
+/// MAC's last byte. The wider CMOS tail (0x40+) is written by POST on
+/// this AMI board and cannot hold evidence.
+/// The config-space write landed with Bus Master set (cmd echo bit 2).
+pub const M_BUS_MASTER: u32 = 1 << 6;
+
 #[must_use]
-pub fn pack_markers(bits: u32, mac: [u8; 6]) -> u32 {
-    let mut xor = 0u8;
-    for b in mac {
-        xor ^= b;
-    }
-    bits | (1 << 6)
-        | (1 << 7)
-        | (u32::from(xor) << 8)
-        | (u32::from(mac[0]) << 16)
-        | (u32::from(mac[5]) << 24)
+pub fn pack_markers(bits: u32, cmd_echo: u8, ring_mid: u8, mac_last: u8) -> u32 {
+    let bm_ok = cmd_echo & 0x04 != 0;
+    bits | if bm_ok { M_BUS_MASTER } else { 0 }
+        | (u32::from(cmd_echo) << 8)
+        | (u32::from(ring_mid) << 16)
+        | (u32::from(mac_last) << 24)
 }
 
 /// Progress stages, written to `MARKER_STAGE_OFF` at each milestone.

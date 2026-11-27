@@ -35,8 +35,15 @@ const REG_TNPDS_LOW: u16 = 0x20; // Tx descriptor ring base, low u32
 const REG_TNPDS_HIGH: u16 = 0x24; // ring base, high u32
 const REG_CR: u16 = 0x37; // RST 0x10 | RE 0x08 | TE 0x04
 const REG_IMR: u16 = 0x3C; // interrupt mask, 16-bit — held at 0
+const REG_TXCONFIG: u16 = 0x40; // Tx DMA burst + interframe gap
 const REG_PHYSTATUS: u16 = 0x6C; // bit 1 = link status
-const REG_TPPOLL: u16 = 0xD0; // NPQ = 0x40: process the Tx ring
+/// The transmit kick (NPQ = 0x40). On the 8168 family this is 0x38 —
+/// right after ChipCmd (Linux r8169, banan-os, and Microsoft's RT
+/// sample all agree). 0xD0 is the OLD RTL8169's address: our kicks
+/// went there for the entire first hardware campaign and the chip
+/// never saw one — reads, writes and echoes all verified while the
+/// descriptor sat unfetched.
+const REG_TPPOLL: u16 = 0x38;
 
 const CR_TE: u8 = 0x04;
 const TPPOLL_NPQ: u8 = 0x40;
@@ -101,6 +108,10 @@ pub struct Nic {
     ring_phys: usize,
     frame_ptr: *mut u8,
     frame_phys: usize,
+    /// Command-register readback after the bus-master write (echo:
+    /// bits 0-2 must be IO|MEM|BusMaster, want 0x07 — without BM the
+    /// chip cannot start the descriptor DMA at all).
+    cmd_echo: u8,
     /// The next ring slot to arm. The chip walks the ring from TNPDS
     /// and stops at the first descriptor it does not own, so each send
     /// arms the next slot; slot 15 carries EOR and wraps to slot 0.
@@ -132,26 +143,23 @@ impl Nic {
     }
 
     fn w8(&self, off: u16, v: u8) {
-        if self.mem != 0 {
-            // Dword read-modify-write: byte-granular MMIO writes are
-            // the least-tested access form on 8168 silicon, and every
-            // register here can be written dword-aligned.
-            let base = self.mem + usize::from(off & 0xFFFC);
-            let shift = (off & 3) * 8;
-            // SAFETY: device BAR inside the boot identity map (ADR-0013).
-            let cur = unsafe { core::ptr::read_volatile(base as *const u32) };
-            let val = (cur & !(0xFFu32 << shift)) | (u32::from(v) << shift);
-            unsafe { core::ptr::write_volatile(base as *mut u32, val) };
-        } else {
+        // Writes go through the I/O BAR when present: port I/O is the
+        // proven write path on this platform (CMOS, PIC, PIT all use
+        // it), while posted MMIO writes to this endpoint were never
+        // verified to land. Reads stay on MMIO (the MAC canary proves
+        // them). The I/O BAR mirrors the same 256-byte register file.
+        if self.io != 0 {
             out8(self.io + off, v);
+        } else {
+            mm8w(self.mem, off, v);
         }
     }
 
     fn w32(&self, off: u16, v: u32) {
-        if self.mem != 0 {
-            mm32w(self.mem, off, v);
-        } else {
+        if self.io != 0 {
             out32(self.io + off, v);
+        } else {
+            mm32w(self.mem, off, v);
         }
     }
 
@@ -166,6 +174,37 @@ impl Nic {
     #[must_use]
     pub fn mac(&self) -> [u8; 6] {
         self.mac
+    }
+
+    /// TxConfig byte 1 echo: bits 15:8 carry the TX DMA-burst config;
+    /// the healthy driver value echoes 0x0f.
+    #[must_use]
+    pub fn txcfg_b1(&self) -> u8 {
+        (self.r32(REG_TXCONFIG) >> 8) as u8
+    }
+
+    /// The command-register readback after the bus-master write
+    /// (echo: bits 0-2 = IO|MEM|BusMaster, want 0x07).
+    #[must_use]
+    pub fn cmd_echo(&self) -> u8 {
+        self.cmd_echo
+    }
+
+    /// True when the chip's TNPDS echo equals our ring base in full —
+    /// i.e. the base it walks is the one we programmed. The high byte
+    /// alone is ambiguous: the heap sits below 16 MiB on this boot, so
+    /// a default-0 register echoes 0 spuriously.
+    #[must_use]
+    pub fn ring_latched(&self) -> bool {
+        self.r32(REG_TNPDS_LOW) == self.ring_phys as u32
+    }
+
+    /// TNPDS echo, byte 2 (bits 23:16 of the ring base). The heap's
+    /// conservative layout puts the ring at 0x01-0x02 MiB-region, so a
+    /// landed write echoes 0x01-0x02 here and a default reads 0x00.
+    #[must_use]
+    pub fn ring_mid(&self) -> u8 {
+        (self.r32(REG_TNPDS_LOW) >> 16) as u8
     }
 }
 
@@ -373,14 +412,20 @@ pub fn probe(
     // write only because firmware used it to boot; the NIC was never
     // boot-critical, so its command register arrived with BusMaster
     // clear — registers read fine, the PHY ran, but the DMA engine
-    // never fetched a descriptor (the M710q smoke: LINK_UP set,
-    // UDP never accepted, until this write). Keep the status half
-    // of the dword: the command register is the low 16 bits only.
+    // never fetched a descriptor. Keep the status half of the dword:
+    // the command register is the low 16 bits only. The readback is
+    // the echo canary: if the config DATA write does not land, Bus
+    // Master stays off and the chip cannot DMA at all.
+    let mut cmd_echo = 0u8;
     if let Some((b, d, fb)) = loc {
         let raw = crate::nvme::cfg32(b, d, fb + 0x04);
-        let cmd = (raw & 0xFFFF_0000) | 0x0007;
-        cfg32w(b, d, fb + 0x04, cmd);
-        uart.write_str("NIC: cmd reg set (io+mem+busmaster)\n");
+        cfg32w(b, d, fb + 0x04, (raw & 0xFFFF_0000) | 0x0007);
+        cmd_echo = (crate::nvme::cfg32(b, d, fb + 0x04) & 0xFF) as u8;
+        uart.write_str("NIC: cmd echo ");
+        const HEXC: &[u8] = b"0123456789ABCDEF";
+        uart.write_byte(HEXC[usize::from(cmd_echo >> 4)]);
+        uart.write_byte(HEXC[usize::from(cmd_echo & 0xF)]);
+        uart.write_byte(b'\n');
     }
 
     // ---- the fingerprint dump ----
@@ -404,6 +449,7 @@ pub fn probe(
         ring_phys,
         frame_ptr,
         frame_phys,
+        cmd_echo,
         tx_slot: 0,
     };
     // Interrupts stay masked (fire-and-forget TX); a dropped IMR write
@@ -414,6 +460,34 @@ pub fn probe(
     let cr = nic.r8(REG_CR);
     nic.w8(REG_CR, cr | CR_TE);
     uart.write_str("NIC: transmit enabled (no soft reset)\n");
+
+    // TxConfig: the DMA-burst/interframe-gate configuration. Firmware's
+    // hand-off value is unknown; the healthy driver runs 0x4f000f80 on
+    // this chip and transmits with it. Without a sane value here the
+    // chip owns the ring but never DMAs a descriptor (the TE echo, the
+    // TNPDS latch and the kick were all verified good while UDP_OK
+    // stayed clear).
+    const TXCFG_HEALTHY: u32 = 0x4F00_0F80;
+    nic.w32(REG_TXCONFIG, TXCFG_HEALTHY);
+
+    // Clock-request / ASPM-L1 gating at the chip level: Config2.7 and
+    // Config5.0. Linux's rtl_hw_start does this FIRST
+    // (rtl_hw_aspm_clkreq_enable(false)) — with firmware's power bits
+    // left on, the register file answers and writes echo, but the DMA
+    // engine's clock domain stays gated and descriptor fetches never
+    // start (everything else verified good while UDP_OK stayed clear).
+    // The Config registers are LOCKED: writes land only while the
+    // 9346 magic is unlocked (rtl_unlock_config_regs writes 0xC0).
+    const REG_CONFIG2: u16 = 0x53;
+    const REG_CONFIG5: u16 = 0x56;
+    const REG_CFG9346: u16 = 0x50;
+    nic.w8(REG_CFG9346, 0xC0); // unlock config registers
+    let c2 = nic.r8(REG_CONFIG2);
+    nic.w8(REG_CONFIG2, c2 & !0x80); // ClkReqEn off
+    let c5 = nic.r8(REG_CONFIG5);
+    nic.w8(REG_CONFIG5, c5 & !0x01); // ASPM_en off
+    nic.w8(REG_CFG9346, 0x00); // lock again
+    uart.write_str("NIC: clkreq/aspm-l1 cleared (config unlocked)\n");
 
     // The hardware MAC address: two aligned dword reads (IDR0-3,
     // IDR4-5 in the low half of the second). Byte reads of IDR returned
