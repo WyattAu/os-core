@@ -173,6 +173,21 @@ so.
   real address); (3) only 0x38-0x3D CMOS survives POST on this AMI
   board — the wider tail (0x40+) is POST-owned and cannot hold
   evidence (earlier diag reads there were stale garbage).
+- **M4a closed (2026-11-28): tick-to-trade runs ON THE BOARD.** The
+  kernel links omni-md (no_std pipeline seam) and the rxcheck task
+  runs feed datagram -> UDP demux -> SBE decode -> spread strategy ->
+  trade per datagram. Hardware proof, live: 'OMNIOSK RX: 8 feed, 7
+  dec, 7 trades bid=4295151200' — 8 broadcast SBE tick frames
+  published from the operator PC, 7 decoded valid ticks (the first
+  correctly has no reference bid), 7 strategy trades, bid echoed in
+  the beacon. Bring-up bugs fixed: the prev-bid reference must
+  advance on EVERY frame (a Some-only update meant the reference
+  never seeded and every tick was opinion-less); omni-md's omni-ring
+  dep drops default features (the kernel build needs the no_std
+  path); the scheduler widened to 5 slots (the rxcheck spawn
+  silently failed on the full 4-slot scheduler — the chip had been
+  depositing frames into the ring the whole time, proven by the
+  state-dump beacon: rx1 = 1107-byte frame with First|Last).
 - **M3 closed (2026-11-28): NVMe write path on real media.** The box
   was carved: btrfs shrank 2 GiB online, omniosk-scratch partition
   created in the freed tail (python GPT surgery — parted refused the
