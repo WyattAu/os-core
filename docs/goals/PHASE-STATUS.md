@@ -173,6 +173,18 @@ so.
   real address); (3) only 0x38-0x3D CMOS survives POST on this AMI
   board — the wider tail (0x40+) is POST-owned and cannot hold
   evidence (earlier diag reads there were stale garbage).
+- **M3 closed (2026-11-28): NVMe write path on real media.** The box
+  was carved: btrfs shrank 2 GiB online, omniosk-scratch partition
+  created in the freed tail (python GPT surgery — parted refused the
+  mounted shrink). The kernel scans the GPT (matches the partition by
+  UTF-16 name), writes two patterned sectors, reads back, compares:
+  OMNIOSK NVME WRITE PASS beacons x3, marker bit WRITE set, the
+  read-consistency + RX beacons intact in the same run. The
+  qemu-limine gate mirrors the real layout: ONE GPT disk with p1 ESP
+  + p2 scratch (mk-gpt.py: protective MBR, DiskGUID, distinct GUIDs,
+  CRC over the full 4096-byte array — OVMF rejects a short array
+  CRC). Beacon TX + RX closed earlier the same day (TxPoll 0x38;
+  firewalld port; rxcheck task in a widened 5-slot scheduler).
 - **Beacon TX closed (2026-11-27 evening): the kick register was
   wrong for the whole 8168 family.** The TPPOLL (TxPoll) register is
   **0x38** on the 8168 line — right after ChipCmd — not 0xD0 (that is
