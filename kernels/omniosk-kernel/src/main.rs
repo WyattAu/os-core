@@ -845,15 +845,25 @@ static RX_FRAMES: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
 static RX_FEED: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
+/// The tick-to-trade counters: frames decoded as valid ticks, and
+/// strategy trades fired (omni-md::strategy::decide).
+static FEED_DEC: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+static FEED_TRADES: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+static LAST_BID: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+static PREV_VALID: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
 
 /// The NIC handoff to the receive task (same static-mut pattern as
 /// NVME_SESSION: the boot thread owns it until the verdict, then the
 /// PIT-dispatched task polls the ring through this static).
 static mut NIC_OPT: Option<rtl8168::Nic> = None;
 
-/// The UDP port the feed arrives on (the demo's feed socket; 9934
-/// keeps the 9933 beacon/collector port free).
-const FEED_PORT: u16 = 9934;
+/// The UDP port the feed arrives on: omni-md-server's UDP feed
+/// convention (OMNI_UDP_PORT default 9990).
+const FEED_PORT: u16 = 9990;
 
 /// Task: poll the Rx ring (up to 16 frames per tick), count frames
 /// and feed datagrams (UDP, our IP, the feed port). Stays live for
@@ -875,7 +885,7 @@ fn task_rx(_ctx: &mut TaskCtx) -> TaskFlow {
         // feed port. The dst IP is deliberately not matched — feed
         // datagrams may arrive broadcast (192.168.1.255) while the
         // board's stack is down.
-        if n >= 38
+        if n >= 82
             && buf[12] == 0x08
             && buf[13] == 0x00
             && buf[23] == 17
@@ -883,6 +893,25 @@ fn task_rx(_ctx: &mut TaskCtx) -> TaskFlow {
             && buf[37] == (FEED_PORT & 0xFF) as u8
         {
             RX_FEED.fetch_add(1, Ordering::Relaxed);
+            // tick-to-trade: decode the SBE tick (omni-md::strategy
+            // never sees the wire, only the 40-byte frame), fire the
+            // spread rule, then seed the bid reference from THIS frame
+            // — decide returns None for the first tick (no reference)
+            // and the reference must advance regardless, or no tick
+            // ever gets a previous bid to compare against.
+            let this_bid = u64::from_le_bytes(buf[58..66].try_into().unwrap_or([0; 8]));
+            let prev = PREV_VALID.load(Ordering::Relaxed);
+            let prev_bid = LAST_BID.load(Ordering::Relaxed);
+            let prev_opt = if prev { Some(prev_bid) } else { None };
+            if let Some((side, _tick)) = omni_md::strategy::decide(&buf[42..82], prev_opt) {
+                FEED_DEC.fetch_add(1, Ordering::Relaxed);
+                if side == omni_md::strategy::Side::Buy || side == omni_md::strategy::Side::Sell
+                {
+                    FEED_TRADES.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            LAST_BID.store(this_bid, Ordering::Relaxed);
+            PREV_VALID.store(true, Ordering::Relaxed);
         }
     }
     TaskFlow::Continue
@@ -2083,16 +2112,25 @@ extern "C" fn kernel_main() -> ! {
             tag[i] = *c;
             i += 1;
         }
-        i += push_dec(&mut tag[i..], rx_n);
-        for c in b" frames, " {
-            tag[i] = *c;
-            i += 1;
-        }
+        let dec = FEED_DEC.load(Ordering::Relaxed);
+        let trades = FEED_TRADES.load(Ordering::Relaxed);
+        let bid = LAST_BID.load(Ordering::Relaxed);
         i += push_dec(&mut tag[i..], rx_f);
-        for c in b" feed" {
+        for c in b" feed, " {
             tag[i] = *c;
             i += 1;
         }
+        i += push_dec(&mut tag[i..], dec);
+        for c in b" dec, " {
+            tag[i] = *c;
+            i += 1;
+        }
+        i += push_dec(&mut tag[i..], trades);
+        for c in b" trades bid=" {
+            tag[i] = *c;
+            i += 1;
+        }
+        i += push_dec(&mut tag[i..], bid as usize);
         let tag_str = core::str::from_utf8(&tag[..i]).unwrap_or("OMNIOSK RX");
         beacon(nic, &mut uart, tag_str);
         // The full-chip state dump: one big beacon, hex dwords.

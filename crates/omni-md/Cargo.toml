@@ -12,6 +12,6 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
-omni-ring = { path = "../omni-ring", version = "0.2" }
+omni-ring = { path = "../omni-ring", version = "0.2", default-features = false }
 omni-sbe = { path = "../omni-sbe", version = "0.1" }
 omni-tick = { path = "../omni-tick", version = "0.2" }
