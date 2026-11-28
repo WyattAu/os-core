@@ -36,7 +36,13 @@ const REG_TNPDS_HIGH: u16 = 0x24; // ring base, high u32
 const REG_CR: u16 = 0x37; // RST 0x10 | RE 0x08 | TE 0x04
 const REG_IMR: u16 = 0x3C; // interrupt mask, 16-bit — held at 0
 const REG_TXCONFIG: u16 = 0x40; // Tx DMA burst + interframe gap
+const REG_RXCFG: u16 = 0x44; // Rx: FIFO thresh, DMA burst, accept bits
+const REG_RMS: u16 = 0xDA; // RxMaxSize: frames larger are dropped
 const REG_PHYSTATUS: u16 = 0x6C; // bit 1 = link status
+const REG_RDSAR_LOW: u16 = 0xE4; // Rx ring base (latched on RE 1->0->1)
+const REG_RDSAR_HIGH: u16 = 0xE8;
+const REG_MPC: u16 = 0x4C; // missed packet counter (32-bit)
+const REG_GPHY_OCP: u16 = 0xB8; // GPHY OCP access (flag + reg<<15 + data)
 /// The transmit kick (NPQ = 0x40). On the 8168 family this is 0x38 —
 /// right after ChipCmd (Linux r8169, banan-os, and Microsoft's RT
 /// sample all agree). 0xD0 is the OLD RTL8169's address: our kicks
@@ -46,6 +52,7 @@ const REG_PHYSTATUS: u16 = 0x6C; // bit 1 = link status
 const REG_TPPOLL: u16 = 0x38;
 
 const CR_TE: u8 = 0x04;
+const CR_RE: u8 = 0x08;
 const TPPOLL_NPQ: u8 = 0x40;
 
 /// Tx descriptor (16 bytes): opts1 @0 (OWN 31 | EOR 30 | FS 29 | LS 28
@@ -116,7 +123,25 @@ pub struct Nic {
     /// and stops at the first descriptor it does not own, so each send
     /// arms the next slot; slot 15 carries EOR and wraps to slot 0.
     tx_slot: usize,
+    /// Receive ring: descriptor array (8 x 16 B) and the physical
+    /// base of each descriptor's 4 KiB buffer. Poll-only: no Rx
+    /// interrupts, the kernel task walks the ring every tick.
+    rx_ring: *mut u8,
+    rx_buf_phys: [usize; 8],
+    rx_tail: usize,
 }
+
+// SAFETY: the Nic lives in the boot thread until the verdict, then is
+// handed exclusively to the PIT-dispatched task on the same core (ISR
+// interleaving, never parallel access); its raw pointers target
+// identity-mapped RAM that is never freed while the kernel runs.
+unsafe impl Send for Nic {}
+unsafe impl Sync for Nic {}
+
+/// Rx ring shape: 8 descriptors x 4 KiB buffers, feed frames are
+/// well under the 2048-byte RxMaxSize.
+const RX_RING_DESCS: usize = 8;
+const RX_BUF_SIZE: u32 = 4096;
 
 impl Nic {
     /// The 8168's MMIO register file is only reliably readable with
@@ -183,11 +208,149 @@ impl Nic {
         (self.r32(REG_TXCONFIG) >> 8) as u8
     }
 
+    /// ChipCmd readback (echo: RE|TE must be set after rx_start).
+    #[must_use]
+    pub fn chipcmd(&self) -> u8 {
+        self.r8(REG_CR)
+    }
+
+    /// RxConfig byte 0 echo: the accept bits (AB|AMC|ACP want 0x0E).
+    #[must_use]
+    pub fn rxcfg_echo(&self) -> u8 {
+        self.r32(REG_RXCFG) as u8
+    }
+
+    /// Missed-packet counter low byte (register 0x4C, count in bits
+    /// 23:0): frames the chip received but could not deposit — > 0
+    /// means the ring or RDSAR is the problem, 0 means nothing was
+    /// received at all.
+    #[must_use]
+    pub fn missed_lo(&self) -> u8 {
+        self.r32(REG_MPC) as u8
+    }
+
+    /// GPHY OCP read: register window 0xB8, OCPAR flag 0x8000_0000,
+    /// `reg << 15`. Returns the 16-bit PHY register value once the
+    /// flag sets, None on timeout.
+    fn gphy_ocp_read(&self, reg: u32) -> Option<u16> {
+        if reg > 0xFFFF {
+            return None;
+        }
+        self.w32(REG_GPHY_OCP, reg << 15);
+        let mut spins = 0u32;
+        while spins < 4_000 {
+            let v = self.r32(REG_GPHY_OCP);
+            if v & 0x8000_0000 != 0 {
+                return Some((v & 0xFFFF) as u16);
+            }
+            spins += 1;
+            core::hint::spin_loop();
+        }
+        None
+    }
+
+    /// GPHY OCP write: flag + `reg << 15` + data; the flag clears on
+    /// completion. Returns false on timeout.
+    fn gphy_ocp_write(&self, reg: u32, data: u16) -> bool {
+        if reg > 0xFFFF {
+            return false;
+        }
+        self.w32(REG_GPHY_OCP, 0x8000_0000 | (reg << 15) | u32::from(data));
+        let mut spins = 0u32;
+        while spins < 4_000 {
+            if self.r32(REG_GPHY_OCP) & 0x8000_0000 == 0 {
+                return true;
+            }
+            spins += 1;
+            core::hint::spin_loop();
+        }
+        false
+    }
+
+    /// Disables the RTL8168G PHY ALDPS (Advanced Link Power Down
+    /// Power Saving): Linux rtl8168g_disable_aldps — clear BIT(2) of
+    /// PHY paged register 0x0a43:0x10. With firmware's ALDPS left on,
+    /// the PHY receiver power-gates and the MAC sees no frames at all
+    /// (missed-packet counter stays 0) despite a trained link and Tx
+    /// working — the exact RX-death signature of the M710q runs.
+    /// GPHY OCP address: page 0x0a43 << 4 + reg 0x10 * 2 = 0xa450.
+    pub fn phy_aldps_off(&mut self) -> bool {
+        let addr = 0xA450;
+        let Some(v) = self.gphy_ocp_read(addr) else {
+            return false;
+        };
+        if v & 0x04 == 0 {
+            return true; // already disabled
+        }
+        self.gphy_ocp_write(addr, v & !0x04)
+    }
+
     /// The command-register readback after the bus-master write
     /// (echo: bits 0-2 = IO|MEM|BusMaster, want 0x07).
     #[must_use]
     pub fn cmd_echo(&self) -> u8 {
         self.cmd_echo
+    }
+
+    /// Hex-encodes the state dump into `out` (`"xxxx"` per dword).
+    /// Returns bytes written.
+    pub fn hex_state(&self, out: &mut [u8]) -> usize {
+        let (st, _gphy_ok) = self.state_dump();
+        const HEX: &[u8] = b"0123456789ABCDEF";
+        let mut w = 0usize;
+        for v in st {
+            for shift in [28u32, 24, 20, 16, 12, 8, 4, 0] {
+                if w + 1 < out.len() {
+                    out[w] = HEX[usize::from(((v >> shift) & 0xF) as u8)];
+                    w += 1;
+                }
+            }
+        }
+        w
+    }
+
+    /// Full-chip state dump for the beacon diagnostic channel: every
+    /// register and descriptor word that could explain a silent RX
+    /// path, in one payload. `gphy_ok` false means the PHY OCP window
+    /// timed out (PHY config reads are then garbage).
+    #[must_use]
+    pub fn state_dump(&self) -> ([u32; 16], bool) {
+        let mut st = [0u32; 16];
+        st[0] = self.r32(REG_TXCONFIG);
+        st[1] = self.r32(REG_RXCFG);
+        st[2] = self.r32(REG_TNPDS_LOW);
+        st[3] = self.r32(REG_RDSAR_LOW);
+        st[4] = self.r32(REG_RMS);
+        st[5] = self.r32(REG_MPC);
+        st[6] = u32::from(self.r8(REG_CR));
+        st[7] = self.r32(0x3C); // IMR (lo) + ISR (hi)
+        let al = self.gphy_ocp_read(0xA450); // ALDPS paged reg
+        st[8] = al.map(u32::from).unwrap_or(0xFFFF_FFFF);
+        st[9] = self.gphy_ocp_read(0xA400 + 2).map(u32::from).unwrap_or(0xFFFF_FFFF); // BMCR
+        st[10] = self
+            .gphy_ocp_read(0xA400 + 4)
+            .map(u32::from)
+            .unwrap_or(0xFFFF_FFFF); // BMSR (link)
+        st[11] = self.r32(0x38); // TxPoll (should read NPQ echo)
+        // live Rx descriptors 0-2: OWN state says whether the chip
+        // ever touched our ring.
+        for i in 0..3 {
+            // SAFETY: tail-independent ring read; the page is ours and
+            // identity-mapped.
+            let o1 =
+                unsafe { core::ptr::read_volatile(self.rx_ring.add(i * DESC_SIZE).cast::<u32>()) };
+            match omniosk::net::decode_rx_done(o1) {
+                Some((len, f, l)) => {
+                    st[12 + i] = (len as u32)
+                        | if f { 1 << 29 } else { 0 }
+                        | if l { 1 << 28 } else { 0 };
+                }
+                None => {
+                    st[12 + i] = 0xFFFF_FFFF; // still owned by chip
+                }
+            }
+        }
+        (st, st[8] != 0xFFFF_FFFF)
     }
 
     /// True when the chip's TNPDS echo equals our ring base in full —
@@ -205,6 +368,110 @@ impl Nic {
     #[must_use]
     pub fn ring_mid(&self) -> u8 {
         (self.r32(REG_TNPDS_LOW) >> 16) as u8
+    }
+
+    /// RDSAR echo, byte 2 (bits 23:16 of the RX ring base): 0x12 when
+    /// our ring latched, 0x00 when the write is unlanded or the
+    /// register is write-only on this silicon.
+    #[must_use]
+    pub fn rdsar_mid(&self) -> u8 {
+        (self.r32(REG_RDSAR_LOW) >> 16) as u8
+    }
+
+    /// Brings up the receive ring: 8 descriptors, one 4 KiB buffer
+    /// each, poll-only (IMR stays masked; the kernel task walks the
+    /// ring). RxMaxSize 4096 matches the buffers; RxConfig gets the
+    /// Linux VER_40 value plus accept-phys/broadcast/multicast. The
+    /// ring base is programmed across a RE toggle, mirroring the TNPDS
+    /// latch (the chip takes the base on the 1->0->1 transition).
+    ///
+    /// `ring` must address 128 writable bytes (one heap page);
+    /// `buf_phys` holds the physical address of one 4 KiB page per
+    /// descriptor.
+    pub fn rx_start(&mut self, ring: *mut u8, ring_phys: usize, buf_phys: &[usize; 8]) {
+        self.rx_ring = ring;
+        self.rx_buf_phys = *buf_phys;
+        self.rx_tail = 0;
+        // SAFETY: the ring page is ours, identity-mapped; every write
+        // stays inside the 128-byte descriptor array.
+        unsafe {
+            core::ptr::write_bytes(ring, 0, RX_RING_DESCS * DESC_SIZE);
+            for (i, bp) in buf_phys.iter().enumerate() {
+                let desc = omniosk::net::encode_rx_desc(
+                    *bp as u64,
+                    RX_BUF_SIZE,
+                    i + 1 == RX_RING_DESCS,
+                );
+                core::ptr::copy_nonoverlapping(
+                    desc.as_ptr(),
+                    ring.add(i * DESC_SIZE),
+                    DESC_SIZE,
+                );
+            }
+        }
+        self.w32(REG_RDSAR_LOW, ring_phys as u32);
+        self.w32(REG_RDSAR_HIGH, (ring_phys >> 32) as u32);
+        // RxMaxSize: frames larger than a buffer are dropped by the
+        // chip; 4096 matches the buffers (word register, two bytes).
+        self.w8(REG_RMS, (RX_BUF_SIZE & 0xFF) as u8);
+        self.w8(REG_RMS + 1, (RX_BUF_SIZE >> 8) as u8);
+        // RxConfig: PRESERVE the firmware-programmed value and only OR
+        // in the accept bits (phys/multicast/broadcast). The first
+        // attempt OVERWROTE the register with the Linux VER_40 default
+        // (0xe70e) — that clobbered G-generation enable bits firmware
+        // had set (bits 14-17) and the MAC went deaf: RxCfg echoed
+        // 0x0e, ChipCmd 0x0c, missed counter 0, zero frames deposited
+        // across a 5-minute broadcast storm. OR-in only.
+        let cfg = self.r32(REG_RXCFG);
+        self.w32(REG_RXCFG, cfg | 0x0E);
+        let cr = self.r8(REG_CR);
+        self.w8(REG_CR, cr & !CR_RE);
+        self.w8(REG_CR, cr | CR_RE | CR_TE);
+        // The PHY receiver must be un-power-gated for any of the above
+        // to matter (see phy_aldps_off).
+        self.phy_aldps_off();
+    }
+
+    /// Polls one received frame into `out` and re-arms the descriptor.
+    /// Returns the frame length (Ethernet header + payload, FCS
+    /// stripped) or `None` when the chip still owns the descriptor
+    /// (nothing new) or the frame was fragmented/oversized (re-armed
+    /// and skipped).
+    pub fn rx_next(&mut self, out: &mut [u8]) -> Option<usize> {
+        let i = self.rx_tail;
+        // SAFETY: tail < RX_RING_DESCS; the ring page is ours and
+        // identity-mapped.
+        let desc = unsafe { self.rx_ring.add(i * DESC_SIZE) };
+        // SAFETY: the ring page is ours, identity-mapped; the volatile
+        // read observes the chip's DMA completion write (coherent).
+        let opts1 = unsafe { core::ptr::read_volatile(desc.cast::<u32>()) };
+        let Some((len_incl, first, last)) = omniosk::net::decode_rx_done(opts1) else {
+            return None;
+        };
+        let mut got = None;
+        // A complete, fitting frame: hand it out (FCS stripped).
+        if first && last && len_incl >= 4 && len_incl - 4 <= out.len() {
+            let n = len_incl - 4;
+            let buf = self.rx_buf_phys[i];
+            // SAFETY: the buffer page is ours, identity-mapped; the
+            // length is bounded by RxMaxSize <= the buffer size.
+            let frame =
+                unsafe { core::slice::from_raw_parts(buf as *const u8, n) };
+            out[..n].copy_from_slice(frame);
+            got = Some(n);
+        }
+        // Re-arm the descriptor for the chip (same buffer, OWN again).
+        // SAFETY: same ring bounds as the read above.
+        let rearm = omniosk::net::encode_rx_desc(
+            self.rx_buf_phys[i] as u64,
+            RX_BUF_SIZE,
+            i + 1 == RX_RING_DESCS,
+        );
+        unsafe {
+            core::ptr::copy_nonoverlapping(rearm.as_ptr(), desc, DESC_SIZE);
+        }
+        self.rx_tail = (i + 1) % RX_RING_DESCS;
+        got
     }
 }
 
@@ -451,6 +718,9 @@ pub fn probe(
         frame_phys,
         cmd_echo,
         tx_slot: 0,
+        rx_ring: core::ptr::null_mut(),
+        rx_buf_phys: [0; 8],
+        rx_tail: 0,
     };
     // Interrupts stay masked (fire-and-forget TX); a dropped IMR write
     // is harmless — firmware's IMR may still line up IRQs, but the

@@ -732,6 +732,30 @@ fn beacon(nic: &mut rtl8168::Nic, uart: &mut Serial<RawPorts>, tag: &str) -> boo
     any
 }
 
+/// Writes `v` in decimal into `buf`, returns bytes written.
+fn push_dec(buf: &mut [u8], mut v: usize) -> usize {
+    if v == 0 {
+        if let Some(slot) = buf.first_mut() {
+            *slot = b'0';
+        }
+        return 1;
+    }
+    let mut digits = [0u8; 20];
+    let mut n = 0usize;
+    while v > 0 && n < digits.len() {
+        digits[n] = b'0' + (v % 10) as u8;
+        v /= 10;
+        n += 1;
+    }
+    let mut w = 0usize;
+    while n > 0 && w < buf.len() {
+        n -= 1;
+        buf[w] = digits[n];
+        w += 1;
+    }
+    w
+}
+
 fn kernel_sleep_ticks(uart: &mut Serial<RawPorts>, target: usize) -> usize {
     use core::sync::atomic::Ordering;
     let start = TIMER_TICKS.load(Ordering::Relaxed);
@@ -795,7 +819,7 @@ fn timer_smoke(min_ticks: usize, max_iterations: usize) -> usize {
 /// Task slots dispatched by the PIT ISR (round-robin, omni-task).
 /// `None` until kernel_main builds the scheduler; the ISR skips
 /// dispatch while it is absent (pre-registration ticks are safe).
-static mut SCHED: Option<Scheduler<4>> = None;
+static mut SCHED: Option<Scheduler<5>> = None;
 
 /// The live NVMe session, handed to the blockcheck task by kernel_main
 /// after the smoke (the omni-block seam, task-consumed).
@@ -814,6 +838,55 @@ static BLOCKCHECK_OK: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
 static BLOCKCHECK_FAIL: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
+
+/// Receive-path counters: every Ethernet frame the ring deposits, and
+/// how many were feed datagrams (UDP to the feed port, our IP).
+static RX_FRAMES: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+static RX_FEED: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+/// The NIC handoff to the receive task (same static-mut pattern as
+/// NVME_SESSION: the boot thread owns it until the verdict, then the
+/// PIT-dispatched task polls the ring through this static).
+static mut NIC_OPT: Option<rtl8168::Nic> = None;
+
+/// The UDP port the feed arrives on (the demo's feed socket; 9934
+/// keeps the 9933 beacon/collector port free).
+const FEED_PORT: u16 = 9934;
+
+/// Task: poll the Rx ring (up to 16 frames per tick), count frames
+/// and feed datagrams (UDP, our IP, the feed port). Stays live for
+/// the whole run — the beacon at the end reports the counters.
+fn task_rx(_ctx: &mut TaskCtx) -> TaskFlow {
+    use core::sync::atomic::Ordering;
+    // SAFETY: dispatch context (IF cleared, no reentrancy); the static
+    // is the sole owner after the handoff (same pattern as SCHED).
+    let Some(nic) = (unsafe { (*core::ptr::addr_of_mut!(NIC_OPT)).as_mut() }) else {
+        return TaskFlow::Continue;
+    };
+    let mut buf = [0u8; 2048];
+    for _ in 0..16 {
+        let Some(n) = nic.rx_next(&mut buf) else {
+            break;
+        };
+        RX_FRAMES.fetch_add(1, Ordering::Relaxed);
+        // Feed demux: ethertype 0x0800, protocol UDP, dst port the
+        // feed port. The dst IP is deliberately not matched — feed
+        // datagrams may arrive broadcast (192.168.1.255) while the
+        // board's stack is down.
+        if n >= 38
+            && buf[12] == 0x08
+            && buf[13] == 0x00
+            && buf[23] == 17
+            && buf[36] == (FEED_PORT >> 8) as u8
+            && buf[37] == (FEED_PORT & 0xFF) as u8
+        {
+            RX_FEED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    TaskFlow::Continue
+}
 
 /// Task: read LBA 0 through the `BlockDevice` trait and verify the
 /// magic. Retires after 3 successful reads; a failure retires the
@@ -1516,6 +1589,8 @@ extern "C" fn kernel_main() -> ! {
         let mut nic_opt: Option<rtl8168::Nic> = None;
         let mut udp_ok = false;
         let mut dma32_ok = false;
+        let mut rx_ring = (0usize, core::ptr::null_mut());
+        let mut rx_bufs = [0usize; 8];
         cmos::write_stage(&mut ports, cmos::STAGE_NIC_START);
         {
             // The 8168 family does 32-bit DMA only (Linux sets a 32-bit
@@ -1542,6 +1617,35 @@ extern "C" fn kernel_main() -> ! {
                     Err(_) => break,
                 }
             }
+            // Rx ring + 8 buffers: same low-page rule. Failure keeps RX
+            // off (the run still TXs and smokes).
+            let mut rx_ok = true;
+            for slot in core::iter::once(&mut rx_ring.0).chain(rx_bufs.iter_mut()) {
+                let mut got = None;
+                let mut t = 0u32;
+                while got.is_none() && t < 4_096 {
+                    t += 1;
+                    match heap.alloc() {
+                        Ok(a) if a < 0x1_0000_0000 => got = Some(a),
+                        Ok(a) => {
+                            let _ = heap.free(a);
+                        }
+                        Err(_) => break,
+                    }
+                }
+                match got {
+                    Some(a) => *slot = a,
+                    None => {
+                        rx_ok = false;
+                        break;
+                    }
+                }
+            }
+            if rx_ok {
+                rx_ring.1 = rx_ring.0 as *mut u8;
+            } else {
+                rx_ring.0 = 0;
+            }
             if ring_phys.is_some() && frame_phys.is_some() {
                 dma32_ok = true;
             }
@@ -1556,6 +1660,11 @@ extern "C" fn kernel_main() -> ! {
                     frame_phys,
                     &mut uart,
                 ) {
+                    if rx_ok {
+                        // SAFETY: pages are identity-mapped, below
+                        // 4 GiB, never freed (ADR-0013).
+                        nic.rx_start(rx_ring.1, rx_ring.0, &rx_bufs);
+                    }
                     cmos::write_stage(&mut ports, cmos::STAGE_NIC_OK);
                     udp_ok |= beacon(
                         &mut nic,
@@ -1608,9 +1717,9 @@ extern "C" fn kernel_main() -> ! {
                     // echo, the chip's ring-base echo, and the MAC's
                     // last byte (0x65 on the M710q when the window
                     // reads the autoloaded address).
-                    let mac_last = nic_opt
+                    let chipcmd = nic_opt
                         .as_ref()
-                        .map_or(0u8, |n| n.mac()[5]);
+                        .map_or(0u8, |n| n.chipcmd());
                     let link = nic_opt.as_ref().is_some_and(|n| n.link_up());
                     crate::cmos::write_markers(
                         &mut ports,
@@ -1624,9 +1733,9 @@ extern "C" fn kernel_main() -> ! {
                                 } else {
                                     0
                                 },
-                            nic_opt.as_ref().map_or(0u8, |n| n.cmd_echo()),
-                            nic_opt.as_ref().map_or(0u8, |n| n.ring_mid()),
-                            mac_last,
+                            nic_opt.as_ref().map_or(0u8, |n| n.rxcfg_echo()),
+                            nic_opt.as_ref().map_or(0u8, |n| n.rdsar_mid()),
+                            chipcmd,
                         ),
                     );
                     uart.write_str("CMOS: markers written\n");
@@ -1669,12 +1778,22 @@ extern "C" fn kernel_main() -> ! {
                                                 0
                                             }
                                             | crate::cmos::M_UDP_OK,
-                                        nic.cmd_echo(),
-                                        nic.ring_mid(),
-                                        nic.mac()[5],
+                                        nic.rxcfg_echo(),
+                                        nic.rdsar_mid(),
+                                        nic.chipcmd(),
                                     ),
                                 );
                                 uart.write_str("CMOS: udp-ok bit written\n");
+                            }
+                            // Hand the NIC to the receive task: the boot
+                            // thread stops touching it here; the PIT-
+                            // dispatched rxcheck task owns the ring from
+                            // the scheduler start onward. SAFETY: single-
+                            // threaded boot context; the static is the
+                            // sole owner past this point (NVME_SESSION
+                            // pattern).
+                            unsafe {
+                                core::ptr::addr_of_mut!(NIC_OPT).write(Some(nic));
                             }
                     }
                 }
@@ -1802,6 +1921,7 @@ extern "C" fn kernel_main() -> ! {
     let _ = fresh.spawn("retire", task_retire);
     let _ = fresh.spawn("sleeper", task_sleeper);
     let _ = fresh.spawn("blockcheck", task_blockcheck);
+    let _ = fresh.spawn("rxcheck", task_rx);
     // SAFETY: see above.
     unsafe { *sched = Some(fresh) };
 
@@ -1901,6 +2021,46 @@ extern "C" fn kernel_main() -> ! {
     // success marker unconditionally so the QEMU smoke gate is clean.
     uart.write_str("RING SMOKE PASS\n");
     uart.write_str("HALT (idle, 1 kHz tick)\n");
+    // ---- receive summary: the last beacon reports what the ring saw
+    // over the whole run (the rxcheck task has been polling since the
+    // scheduler started) ----
+    if let Some(nic) = (unsafe { (*core::ptr::addr_of_mut!(NIC_OPT)).as_mut() }) {
+        use core::sync::atomic::Ordering;
+        let rx_n = RX_FRAMES.load(Ordering::Relaxed);
+        let rx_f = RX_FEED.load(Ordering::Relaxed);
+        let mut tag = [0u8; 64];
+        let mut i = 0usize;
+        for c in b"OMNIOSK RX: " {
+            tag[i] = *c;
+            i += 1;
+        }
+        i += push_dec(&mut tag[i..], rx_n);
+        for c in b" frames, " {
+            tag[i] = *c;
+            i += 1;
+        }
+        i += push_dec(&mut tag[i..], rx_f);
+        for c in b" feed" {
+            tag[i] = *c;
+            i += 1;
+        }
+        let tag_str = core::str::from_utf8(&tag[..i]).unwrap_or("OMNIOSK RX");
+        beacon(nic, &mut uart, tag_str);
+        // The full-chip state dump: one big beacon, hex dwords.
+        let mut hexbuf = [0u8; 132];
+        let n = nic.hex_state(&mut hexbuf[8..]);
+        for (j, c) in b"DUMP:".iter().enumerate() {
+            hexbuf[j] = *c;
+        }
+        let _ = n;
+        if let Ok(s) = core::str::from_utf8(&hexbuf[..n + 8]) {
+            beacon(nic, &mut uart, s);
+        }
+        uart.write_str("RX: ");
+        uart.write_str(tag_str);
+        uart.write_str("\n");
+    }
+
     cmos::write_stage(&mut ports, cmos::STAGE_VERDICT);
     machine_exit(&mut ports, &mut uart, 31)
 }

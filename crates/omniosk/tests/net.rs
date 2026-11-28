@@ -5,8 +5,8 @@
 //! zero-beacon boot on real hardware (which is exactly what shipped).
 
 use omniosk::net::{
-    build_udp_frame, encode_tx_desc, IPV4_HDR, MAX_FRAME, MIN_FRAME, OPTS_EOR, OPTS_FS, OPTS_LS,
-    OPTS_OWN, UDP_HDR,
+    build_udp_frame, encode_rx_desc, encode_tx_desc, IPV4_HDR, MAX_FRAME, MIN_FRAME, OPTS_EOR,
+    OPTS_FS, OPTS_LS, OPTS_OWN, UDP_HDR,
 };
 
 fn be16_at(buf: &[u8], off: usize) -> Option<u16> {
@@ -123,4 +123,44 @@ fn short_buffer_is_rejected() {
         build_udp_frame(&mut buf, [0; 6], [0; 4], [0; 4], 1, 1, &[]),
         None
     );
+}
+
+// ---- RX descriptor contract ----
+
+fn rx_opts1(desc: &[u8; 16]) -> Option<u32> {
+    let b: [u8; 4] = desc.get(0..4)?.try_into().ok()?;
+    Some(u32::from_le_bytes(b))
+}
+
+fn rx_addr(desc: &[u8; 16]) -> Option<u64> {
+    let b: [u8; 8] = desc.get(8..16)?.try_into().ok()?;
+    Some(u64::from_le_bytes(b))
+}
+
+#[test]
+fn rx_desc_init_carries_own_buffer_size_and_ring_end() {
+    let desc = encode_rx_desc(0x0001_2000, 4096, true);
+    assert_eq!(
+        rx_opts1(&desc),
+        Some(omniosk::net::RX_OWN | omniosk::net::RX_RING_END | 4096)
+    );
+    assert_eq!(rx_addr(&desc), Some(0x0001_2000));
+}
+
+#[test]
+fn rx_desc_done_clears_own_and_reports_len_frags() {
+    // The chip deposits a frame and clears OWN, writing the length
+    // (incl. FCS) plus First|Last fragment flags.
+    let mut desc = encode_rx_desc(0x1000, 4096, false);
+    let b: &mut [u8] = desc.as_mut_slice();
+    let done = omniosk::net::RX_FIRST_FRAG | omniosk::net::RX_LAST_FRAG | 0x59;
+    let (head, _rest) = b.split_at_mut(4);
+    head.copy_from_slice(&done.to_le_bytes());
+    assert_eq!(omniosk::net::decode_rx_done(done), Some((0x59, true, true)));
+}
+
+#[test]
+fn rx_desc_owned_by_chip_reads_as_pending() {
+    let desc = encode_rx_desc(0x1000, 4096, false);
+    assert_eq!(rx_opts1(&desc).and_then(omniosk::net::decode_rx_done), None);
 }

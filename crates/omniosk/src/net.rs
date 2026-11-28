@@ -142,3 +142,51 @@ pub fn build_udp_frame(
 
     Some(total)
 }
+
+// ---- RX descriptor contract (RTL8168G, DEFAULT descriptor type;
+// Linux r8169_main.c: pkt_size = status & GENMASK(13, 0), OWN = bit 31,
+// RingEnd = bit 30, First/LastFrag = bits 29/28. Init hands
+// OWN | buffer-size to the chip; the chip clears OWN on deposit.) ----
+
+/// Rx descriptor `opts1`: the chip owns the buffer.
+pub const RX_OWN: u32 = 0x8000_0000;
+/// Rx descriptor `opts1`: last descriptor of the ring.
+pub const RX_RING_END: u32 = 0x4000_0000;
+/// Rx descriptor `opts1`: this buffer holds the first fragment.
+pub const RX_FIRST_FRAG: u32 = 0x2000_0000;
+/// Rx descriptor `opts1`: this buffer holds the last fragment.
+pub const RX_LAST_FRAG: u32 = 0x1000_0000;
+/// Rx descriptor `opts1` bits 13:0: the deposited frame length
+/// including the 4-byte FCS.
+pub const RX_LEN_MASK: u32 = 0x0000_3FFF;
+
+/// Encodes an RX descriptor handed to the chip (init state): OWN set,
+/// the length field carrying the buffer capacity, optional ring-end.
+#[must_use]
+pub fn encode_rx_desc(buf_phys: u64, buf_size: u32, eor: bool) -> [u8; 16] {
+    let mut opts1 = RX_OWN | (buf_size & RX_LEN_MASK);
+    if eor {
+        opts1 |= RX_RING_END;
+    }
+    let mut desc = [0u8; 16];
+    let (head, rest) = desc.split_at_mut(4);
+    head.copy_from_slice(&opts1.to_le_bytes());
+    let (_opts2, addr) = rest.split_at_mut(4);
+    addr.copy_from_slice(&buf_phys.to_le_bytes());
+    desc
+}
+
+/// Decodes a completed RX descriptor: `(frame length incl. FCS, first
+/// fragment, last fragment)`. `None` while the chip still owns the
+/// descriptor (no frame deposited yet).
+#[must_use]
+pub fn decode_rx_done(opts1: u32) -> Option<(usize, bool, bool)> {
+    if opts1 & RX_OWN != 0 {
+        return None;
+    }
+    Some((
+        (opts1 & RX_LEN_MASK) as usize,
+        opts1 & RX_FIRST_FRAG != 0,
+        opts1 & RX_LAST_FRAG != 0,
+    ))
+}

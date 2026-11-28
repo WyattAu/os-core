@@ -64,9 +64,9 @@ pub const M_LINK_UP: u32 = 1 << 4;
 pub const M_DMA32: u32 = 1 << 5;
 
 /// Packs the run evidence into the ONE marker word that provably
-/// survives POST on this board (0x3A-0x3D): the claim bits, a TxConfig
-/// echo (byte 1: DMA burst, want 0x0f), the ring-base echo, and the
-/// MAC's last byte. The wider CMOS tail (0x40+) is written by POST on
+/// survives POST on this board (0x3A-0x3D): the claim bits, an RxConfig
+/// echo (byte 1: accept bits, want 0x0e), the missed-packet counter
+/// low byte, and ChipCmd (RE|TE = 0x0c). The wider CMOS tail (0x40+) is written by POST on
 /// this AMI board and cannot hold evidence.
 /// The config-space write landed with Bus Master set (cmd echo bit 2).
 pub const M_BUS_MASTER: u32 = 1 << 6;
