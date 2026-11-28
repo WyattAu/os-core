@@ -1,0 +1,8 @@
+# Tier-a guard: a hung test fails the job in bounded time instead of
+# burning the 1 h runner timeout. The trigger was omni-io's
+# sqpoll_nop_drains on a GitHub hosted runner whose sandbox lets
+# io_uring_setup succeed but starves the SQPOLL kernel thread
+# (2026-11-28, run 46099047022: 1 h hang -> cancelled). 60 s is ~60x
+# the slowest legit test (omni-heap::model, 0.5 s local).
+[profile.default]
+slow-timeout = { period = "60s", terminate-after = 1 }
