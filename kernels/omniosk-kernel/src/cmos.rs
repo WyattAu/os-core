@@ -62,6 +62,8 @@ pub const M_LINK_UP: u32 = 1 << 4;
 /// 8168 family does 32-bit DMA only — with this bit clear, a UDP miss
 /// is an allocation problem, not a transmit problem.
 pub const M_DMA32: u32 = 1 << 5;
+/// The scratch-partition write/read-back smoke passed on real media.
+pub const M_WRITE: u32 = 1 << 7;
 
 /// Packs the run evidence into the ONE marker word that provably
 /// survives POST on this board (0x3A-0x3D): the claim bits, an RxConfig

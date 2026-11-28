@@ -54,16 +54,18 @@ BIN="$TARGET_DIR/x86_64-unknown-none/release/omniosk-kernel"
 # The boot medium: FAT32 with the ESP layout the server has —
 # limine.conf at the root, the kernel ELF, Limine as the fallback loader.
 mkdir -p tests
-rm -f tests/limine-boot.img tests/limine-vars.fd tests/nvme-hw.img
-dd if=/dev/zero of=tests/limine-boot.img bs=1M count=64 status=none
-mformat -F -i tests/limine-boot.img ::/
+rm -f tests/esp.img tests/limine-vars.fd tests/nvme-hw.img
+dd if=/dev/zero of=tests/esp.img bs=1M count=64 status=none
+mformat -F -i tests/esp.img ::/
 printf 'serial: yes\ntimeout: 5\ndefault_entry: 1\n\n/OMNIOSK\n  comment: omniosk-kernel hardware smoke (phase 2)\n  protocol: multiboot2\n  path: boot():/omniosk.elf\n' > tests/limine.conf
-mcopy -i tests/limine-boot.img tests/limine.conf ::/limine.conf
-mcopy -i tests/limine-boot.img "$BIN" ::/omniosk.elf
-mmd -i tests/limine-boot.img ::/EFI
-mmd -i tests/limine-boot.img ::/EFI/BOOT
-mcopy -i tests/limine-boot.img "$LIMINE_EFI" ::/EFI/BOOT/BOOTX64.EFI
-truncate -s 16M tests/nvme-hw.img
+mcopy -i tests/esp.img tests/limine.conf ::/limine.conf
+mcopy -i tests/esp.img "$BIN" ::/omniosk.elf
+mmd -i tests/esp.img ::/EFI
+mmd -i tests/esp.img ::/EFI/BOOT
+mcopy -i tests/esp.img "$LIMINE_EFI" ::/EFI/BOOT/BOOTX64.EFI
+# ONE GPT disk like the real box: p1 = ESP (Limine boots it), p2 =
+# omniosk-scratch for the write smoke. python builds it each run.
+python3 tests/mk-gpt.py tests/nvme-hw.img tests/esp.img
 cp "$VARS_SRC" tests/limine-vars.fd
 
 log="$(mktemp)"
@@ -76,7 +78,7 @@ timeout 120 qemu-system-x86_64 \
     -m 512 \
     -drive if=pflash,format=raw,file="$OVMF",readonly=on \
     -drive if=pflash,format=raw,file=tests/limine-vars.fd \
-    -drive file=tests/limine-boot.img,if=none,format=raw,id=bootdrv \
+    -drive file=tests/nvme-hw.img,if=none,format=raw,id=bootdrv \
     -device nvme,serial=OMNIOSK,drive=bootdrv \
     -serial file:"$log" \
     -display none -no-reboot
@@ -86,6 +88,7 @@ set -e
 fail() {
     echo "qemu-limine: FAIL ($1; qemu status $status)" >&2
     cat "$log" >&2
+    cp "$log" /tmp/limine-last.log
     exit 1
 }
 
@@ -107,6 +110,8 @@ grep -aq "OMNIOSK UP (multiboot2 -> long mode)" "$log" \
     || fail "the multiboot2 handoff never reached the kernel"
 grep -aq "NVME READ CONSISTENT (hw)" "$log" \
     || fail "hw read-consistency smoke failed"
+grep -aq "OMNIOSK NVME WRITE PASS (scratch)" "$log" \
+    || fail "scratch write smoke failed"
 grep -aq "CMOS: markers written" "$log" || fail "CMOS markers not written"
 grep -aq "RESET (multiboot2 smoke done" "$log" \
     || fail "the kernel never reached its reset line"

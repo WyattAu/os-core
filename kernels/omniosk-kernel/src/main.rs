@@ -1709,6 +1709,53 @@ extern "C" fn kernel_main() -> ! {
                 let second_ok = session.read_lba(0, &mut lba0_again).is_ok();
                 let consistent =
                     read_ok && second_ok && lba0[..32] == lba0_again[..32];
+                // M3: the scratch-partition write smoke — find the
+                // omniosk-scratch partition via the GPT name scan and
+                // prove the WRITE path on real media (two sectors,
+                // distinct patterns, read-back compare).
+                let mut write_ok = false;
+                if consistent {
+                    if let Some((s_start, _s_lbas)) = session.find_scratch_partition() {
+                        let mut p1 = [0u8; 512];
+                        let mut p2 = [0u8; 512];
+                        for (i, b) in p1.iter_mut().enumerate() {
+                            *b = (i as u8) ^ 0xA5;
+                        }
+                        for (i, b) in p2.iter_mut().enumerate() {
+                            *b = (i as u8) ^ 0x5A;
+                        }
+                        let mut rb = [0u8; 512];
+                        let mut ok = session.write_lba(s_start, &p1).is_ok()
+                            && session.write_lba(s_start + 1, &p2).is_ok();
+                        ok = ok
+                            && session
+                                .read_lba(s_start, &mut rb)
+                                .is_ok()
+                            && rb == p1;
+                        ok = ok
+                            && session
+                                .read_lba(s_start + 1, &mut rb)
+                                .is_ok()
+                            && rb == p2;
+                        write_ok = ok;
+                    }
+                    uart.write_str(if write_ok {
+                        "OMNIOSK NVME WRITE PASS (scratch)\n"
+                    } else {
+                        "OMNIOSK NVME WRITE FAIL\n"
+                    });
+                    if let Some(nic) = nic_opt.as_mut() {
+                        beacon(
+                            nic,
+                            &mut uart,
+                            if write_ok {
+                                "OMNIOSK NVME WRITE PASS (scratch)"
+                            } else {
+                                "OMNIOSK NVME WRITE FAIL"
+                            },
+                        );
+                    }
+                }
                 if consistent {
                     // The battery-backed evidence: survives the halt,
                     // readable on the next omniosk boot. Everything is
@@ -1728,6 +1775,7 @@ extern "C" fn kernel_main() -> ! {
                                 | crate::cmos::M_READ_CONSISTENT
                                 | if link { crate::cmos::M_LINK_UP } else { 0 }
                                 | if dma32_ok { crate::cmos::M_DMA32 } else { 0 }
+                                | if write_ok { crate::cmos::M_WRITE } else { 0 }
                                 | if nic_opt.as_ref().is_some_and(|n| n.ring_latched()) {
                                     crate::cmos::M_RING_LATCHED
                                 } else {
@@ -1744,7 +1792,7 @@ extern "C" fn kernel_main() -> ! {
                     // The NIC was probed before the smoke (nic_opt).
                     if let Some(mut nic) = nic_opt.take() {
                             let report =
-                                "OMNIOSK HW BOOT: IDENT PASS, READ-CONSISTENT PASS, WRITE SKIPPED (live GPT)";
+                                "OMNIOSK HW BOOT: IDENT PASS, READ-CONSISTENT PASS";
                             for _ in 0..5 {
                                 let sent = nic.send_udp(
                                     [192, 168, 1, 1],
@@ -1772,6 +1820,7 @@ extern "C" fn kernel_main() -> ! {
                                             | crate::cmos::M_READ_CONSISTENT
                                             | if link { crate::cmos::M_LINK_UP } else { 0 }
                                             | if dma32_ok { crate::cmos::M_DMA32 } else { 0 }
+                                            | if write_ok { crate::cmos::M_WRITE } else { 0 }
                                             | if nic.ring_latched() {
                                                 crate::cmos::M_RING_LATCHED
                                             } else {

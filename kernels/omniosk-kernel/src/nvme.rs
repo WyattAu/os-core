@@ -234,6 +234,78 @@ impl NvmeSession {
         Some(size)
     }
 
+    /// GPT scan: find the `omniosk-scratch` partition by its UTF-16LE
+    /// name in the partition array (the primary header's entry list).
+    /// Returns (start LBA, sector count). The name is the discovery
+    /// key on purpose: it survives GUID churn from re-partitioning and
+    /// cannot collide with the operator's partitions.
+    pub fn find_scratch_partition(&mut self) -> Option<(u64, u64)> {
+        const NAME: &[u8] = b"omniosk-scratch";
+        fn name_eq(raw: &[u8], want: &[u8]) -> bool {
+            for (i, &c) in want.iter().enumerate() {
+                let lo = raw.get(i * 2).copied().unwrap_or(0);
+                let hi = raw.get(i * 2 + 1).copied().unwrap_or(0);
+                if lo != c || hi != 0 {
+                    return false;
+                }
+            }
+            let lo = raw.get(want.len() * 2).copied().unwrap_or(0);
+            let hi = raw.get(want.len() * 2 + 1).copied().unwrap_or(0);
+            lo == 0 && hi == 0
+        }
+
+        let mut dbg = Serial::new(RawPorts, COM1);
+        let mut sec = [0u8; 512];
+        self.read_lba(1, &mut sec).ok()?;
+        if &sec[0..8] != b"EFI PART" {
+            dbg.write_str("gpt: no EFI PART sig\n");
+            return None;
+        }
+        let arr_lba = u64::from_le_bytes(sec[72..80].try_into().ok()?);
+        let num = u32::from_le_bytes(sec[80..84].try_into().ok()?) as u64;
+        let esz = u32::from_le_bytes(sec[84..88].try_into().ok()?) as u64;
+        dbg.write_str("gpt: arr=");
+        write_hex(&mut dbg, arr_lba as u32);
+        dbg.write_str(" num=");
+        write_hex(&mut dbg, num as u32);
+        dbg.write_str(" esz=");
+        write_hex(&mut dbg, esz as u32);
+        dbg.write_str("\n");
+        if num == 0 || esz == 0 || esz > 512 || num > 512 {
+            dbg.write_str("gpt: insane geometry\n");
+            return None;
+        }
+        for i in 0..num {
+            let off = (i * esz) as usize;
+            let lba = arr_lba + (off / 512) as u64;
+            let o = off % 512;
+            self.read_lba(lba, &mut sec).ok()?;
+            let e = &sec[o..o + (esz as usize)];
+            if e[0..16].iter().all(|&b| b == 0) {
+                continue; // empty slot
+            }
+            dbg.write_str("gpt: ent ");
+            write_hex(&mut dbg, i as u32);
+            dbg.write_str(" type=");
+            write_hex(&mut dbg, u32::from_le_bytes(e[0..4].try_into().unwrap_or([0; 4])));
+            dbg.write_str(" name=");
+            for k in 0..16usize {
+                let c = e[56 + k * 2];
+                if c != 0 {
+                    dbg.write_byte(c);
+                }
+            }
+            dbg.write_str("\n");
+            if name_eq(&e[56..128], NAME) {
+                let first = u64::from_le_bytes(e[32..40].try_into().ok()?);
+                let last = u64::from_le_bytes(e[40..48].try_into().ok()?);
+                return Some((first, last - first + 1));
+            }
+        }
+        dbg.write_str("gpt: no scratch match\n");
+        None
+    }
+
     /// Reads `lbas` consecutive LBAs starting at `start` into `dst`
     /// (which must be `lbas * 512` bytes). One LBA per trait read,
     /// copied out of the session's DMA page per iteration.
